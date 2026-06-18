@@ -1,0 +1,20 @@
+{
+  "mix_za": {
+    "ApiUrl": "https://integrate.za.mixtelematics.com",
+    "IdentityUrl": "https://identity.za.mixtelematics.com",
+    "IdentityClientId": "your-client-id",
+    "IdentityClientSecret": "your-client-secret",
+    "IdentityUsername": "your-mix-username",
+    "IdentityPassword": "your-mix-password",
+    "IdentityScope": "offline_access+MiX.Integrate"
+  },
+  "mix_uk": {
+    "ApiUrl": "https://integrate.uk.mixtelematics.com",
+    "IdentityUrl": "https://identity.uk.mixtelematics.com",
+    "IdentityClientId": "your-client-id",
+    "IdentityClientSecret": "your-client-secret",
+    "IdentityUsername": "your-mix-username",
+    "IdentityPassword": "your-mix-password",
+    "IdentityScope": "offline_access+MiX.Integrate"
+  }
+}
