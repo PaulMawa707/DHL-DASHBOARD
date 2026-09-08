@@ -133,6 +133,12 @@ def df_to_table_html(
       <input type="search" class="table-search" placeholder="Filter rows..." aria-label="Filter table rows">
     </div>
     <div class="table-toolbar-actions">
+      <button type="button" class="table-export-xlsx" aria-label="Download table as Excel">
+        <svg class="table-export-icon" viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M10 2.5a.75.75 0 0 1 .75.75v7.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 0 1 1.06-1.06l2.22 2.22V3.25A.75.75 0 0 1 10 2.5Zm-6 11.25a.75.75 0 0 1 .75.75v1.25h10.5V14.5a.75.75 0 0 1 1.5 0v2a.75.75 0 0 1-.75.75H4.75a.75.75 0 0 1-.75-.75v-2a.75.75 0 0 1 .75-.75Z"/>
+        </svg>
+        Download Excel
+      </button>
       <label class="table-page-size-label">
         Rows
         <select class="table-page-size" aria-label="Rows per page">
