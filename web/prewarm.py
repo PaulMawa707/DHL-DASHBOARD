@@ -11,6 +11,7 @@ from contextlib import nullcontext
 import operation_log
 
 from data import (
+    cache_age_seconds,
     cache_get,
     load_alarms_last_24h,
     load_dhl_devices,
@@ -46,6 +47,27 @@ except ValueError:
 
 KEEPALIVE_MINUTES = 20
 TOKEN_CHECK_MINUTES = 30
+
+
+def realtime_auto_refresh_seconds() -> int:
+    """How stale realtime status may get before it is re-pulled; 0 disables it."""
+    try:
+        minutes = int(os.environ.get("DHL_REALTIME_AUTO_REFRESH_MINUTES", "30").strip() or "30")
+    except ValueError:
+        minutes = 30
+    if minutes <= 0:
+        return 0
+    return max(60, minutes * 60)
+
+
+def realtime_data_age_seconds() -> float | None:
+    """Age of the realtime snapshot in seconds (None when nothing is loaded).
+
+    Snapshots hydrated from Neon carry their original ``updated_at``, so this
+    stays accurate across serverless cold starts.
+    """
+    return cache_age_seconds("realtime_status")
+
 
 _prewarm_mix_lock = threading.Lock()
 _prewarm_mix_running = False
@@ -198,6 +220,73 @@ def prewarm_cache_sync(*, keep_devices: bool = False, stale_while_revalidate: bo
     """Run prewarm in the current thread (manual Refresh data only)."""
     _prewarm_mix(stale_while_revalidate=stale_while_revalidate)
     _prewarm_vss(keep_devices=keep_devices, stale_while_revalidate=stale_while_revalidate)
+
+
+_auto_realtime_lock = threading.Lock()
+
+
+def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
+    """Re-pull realtime status when it is stale, reusing the stored VSS token.
+
+    apiLogin is never called here: ``vss_no_login_mode`` keeps the existing
+    token in play, and if it is missing or rejected the dashboard keeps showing
+    its cached data instead of burning a login attempt (VSS throttles with
+    10082 after repeated logins).
+    """
+    interval = realtime_auto_refresh_seconds()
+    if not interval and not force:
+        return {"refreshed": False, "reason": "disabled"}
+
+    age = realtime_data_age_seconds()
+    if not force and age is not None and age < interval:
+        return {"refreshed": False, "reason": "fresh", "age_seconds": int(age)}
+
+    if not _auto_realtime_lock.acquire(blocking=False):
+        return {"refreshed": False, "reason": "busy", "age_seconds": int(age) if age is not None else None}
+
+    try:
+        with vss_no_login_mode():
+            if not try_token_without_login():
+                log.info("auto-refresh: no stored VSS token — keeping cached realtime status")
+                return {"refreshed": False, "reason": "no-token"}
+
+            ok, msg = validate_or_renew_token(allow_reauth=False)
+            if not ok:
+                log.info("auto-refresh: stored VSS token unusable (%s)", msg)
+                return {"refreshed": False, "reason": "token-unusable", "message": msg}
+
+            if cache_get("dhl_devices") is None:
+                try:
+                    from data import hydrate_missing_snapshots_from_neon
+
+                    hydrate_missing_snapshots_from_neon(
+                        exclude_keys={"realtime_status", "alarms_24h", "mix_health"}
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("auto-refresh: device hydrate failed: %s", exc)
+
+            operation_log.log_event(
+                "vss_data",
+                "fetch_realtime",
+                "running",
+                f"Auto-refresh: realtime status ({interval // 60} min, stored token)",
+            )
+            rows = len(refresh_realtime_status())
+            operation_log.log_event(
+                "vss_data",
+                "fetch_realtime",
+                "ok",
+                f"Auto-refresh: realtime status complete ({rows} devices)",
+            )
+            log.info("auto-refresh: realtime status updated (%s devices)", rows)
+            return {"refreshed": True, "rows": rows, "age_seconds": 0}
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        log.warning("auto-refresh: realtime status failed: %s", msg)
+        operation_log.log_event("vss_data", "fetch_realtime", "error", f"Auto-refresh failed: {msg}")
+        return {"refreshed": False, "reason": "error", "message": msg}
+    finally:
+        _auto_realtime_lock.release()
 
 
 def start_background_workers() -> None:

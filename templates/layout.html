@@ -60,6 +60,61 @@
     refreshCacheStatus();
     setInterval(refreshCacheStatus, {{ ui_poll_ms }});
 
+    // Realtime auto-refresh. Serverless invocations are short-lived, so the
+    // schedule lives in the page: the server tells us how old the snapshot is,
+    // we add the time since page load, and once that crosses 30 minutes we
+    // ask the server to re-pull using the VSS token it already has (no login).
+    (function () {
+      const intervalSeconds = {{ realtime_auto_refresh_seconds | int }};
+      if (!intervalSeconds) return;
+
+      let ageAtLoad = {{ realtime_age_seconds if realtime_age_seconds is not none else 'null' }};
+      let measuredAt = Date.now();
+      let retryAfter = 0;
+      let inFlight = false;
+
+      function snapshotAgeSeconds() {
+        const elapsed = (Date.now() - measuredAt) / 1000;
+        return ageAtLoad === null ? elapsed : ageAtLoad + elapsed;
+      }
+
+      async function maybeRefresh() {
+        if (inFlight || window.__dashboardRefreshRunning) return;
+        if (document.body.dataset.awaitingRealtime === '1') return;
+        if (Date.now() < retryAfter || snapshotAgeSeconds() < intervalSeconds) return;
+
+        inFlight = true;
+        try {
+          const r = await fetch('/api/refresh/realtime', {
+            method: 'POST',
+            credentials: 'same-origin'
+          });
+          const data = r.ok ? await r.json() : {};
+          if (typeof data.age_seconds === 'number') {
+            ageAtLoad = data.age_seconds;
+            measuredAt = Date.now();
+          }
+          if (data.refreshed) {
+            window.dashboardClearPageCache?.();
+            window.dashboardNavigateTo?.(window.location.href, {
+              force: true,
+              updateHistory: false,
+              background: true
+            });
+          } else if (data.reason && data.reason !== 'fresh') {
+            retryAfter = Date.now() + 5 * 60 * 1000;
+          }
+        } catch (_) {
+          retryAfter = Date.now() + 5 * 60 * 1000;
+        } finally {
+          inFlight = false;
+        }
+      }
+
+      setInterval(maybeRefresh, 30000);
+      maybeRefresh();
+    })();
+
     document.getElementById('btn-refresh')?.addEventListener('click', async function () {
       const btn = this;
       btn.disabled = true;

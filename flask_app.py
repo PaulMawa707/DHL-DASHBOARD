@@ -74,7 +74,13 @@ from vss_client import (  # noqa: E402
     last_vss_token_source,
 )
 from web.auth import login_required, verify_login  # noqa: E402
-from web.prewarm import prewarm_cache_sync, start_background_workers  # noqa: E402
+from web.prewarm import (  # noqa: E402
+    auto_refresh_realtime,
+    prewarm_cache_sync,
+    realtime_auto_refresh_seconds,
+    realtime_data_age_seconds,
+    start_background_workers,
+)
 from web.views import (  # noqa: E402
     alarms_context,
     device_context,
@@ -125,6 +131,11 @@ def _mix_enabled() -> bool:
     return mix_integration_enabled()
 
 
+def _realtime_age_for_ui() -> int | None:
+    age = realtime_data_age_seconds()
+    return int(age) if age is not None else None
+
+
 def _layout_context(*, active: str, **extra):
     ctx = {
         "active_tab": active,
@@ -138,6 +149,8 @@ def _layout_context(*, active: str, **extra):
         "vss_base_url": active_base_url(),
         "awaiting_vss": cache_get("realtime_status") is None,
         "last_refresh_display": last_saved_refresh_display(),
+        "realtime_auto_refresh_seconds": realtime_auto_refresh_seconds(),
+        "realtime_age_seconds": _realtime_age_for_ui(),
     }
     ctx.update(extra)
     return ctx
@@ -305,8 +318,20 @@ def api_cache_status():
             "vss_profile": last_vss_profile(),
             "vss_base_url": active_base_url(),
             "vss_error": last_vss_error(),
+            "realtime_age_seconds": _realtime_age_for_ui(),
+            "realtime_auto_refresh_seconds": realtime_auto_refresh_seconds(),
         }
     )
+
+
+@app.route("/api/refresh/realtime", methods=["POST"])
+@login_required
+def api_refresh_realtime():
+    """Auto-refresh hook: re-pull realtime status using the stored VSS token."""
+    result = auto_refresh_realtime()
+    result.setdefault("age_seconds", _realtime_age_for_ui())
+    result["interval_seconds"] = realtime_auto_refresh_seconds()
+    return jsonify(result)
 
 
 @app.route("/api/refresh", methods=["POST"])
