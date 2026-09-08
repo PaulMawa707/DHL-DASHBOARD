@@ -8,13 +8,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css', v='20260908s') }}">
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <script src="{{ url_for('static', filename='filters.js') }}" defer></script>
   <script src="{{ url_for('static', filename='tables.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='sidebar.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='sidebar.js', v='20260908s') }}" defer></script>
   <script src="{{ url_for('static', filename='dashboard-nav.js') }}" defer></script>
   {% block head_extra %}{% endblock %}
+  <script>
+    // Applied before first paint so the collapsed rail does not flash open.
+    (function () {
+      try {
+        var saved = localStorage.getItem('dhl-sidebar-collapsed');
+        if ((saved === null || saved === '1') && !window.matchMedia('(max-width: 900px)').matches) {
+          document.documentElement.classList.add('sidebar-collapsed');
+        }
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body{% if awaiting_vss %} data-awaiting-realtime="1"{% endif %}>
   {% include 'partials/topbar.html' %}

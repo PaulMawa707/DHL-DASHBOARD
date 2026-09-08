@@ -5,33 +5,54 @@
     return window.matchMedia('(max-width: 900px)').matches;
   }
 
+  function isCollapsed() {
+    return document.documentElement.classList.contains('sidebar-collapsed')
+      || document.body.classList.contains('sidebar-collapsed');
+  }
+
   function setCollapsed(collapsed) {
-    document.body.classList.toggle('sidebar-collapsed', collapsed && !isMobile());
+    var on = collapsed && !isMobile();
+    document.documentElement.classList.toggle('sidebar-collapsed', on);
+    if (document.body) {
+      document.body.classList.toggle('sidebar-collapsed', on);
+    }
     var btn = document.getElementById('sidebar-toggle');
     if (btn) {
-      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-      btn.setAttribute('aria-label', collapsed ? 'Expand sidebar' : 'Collapse sidebar');
+      btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+      btn.setAttribute('aria-label', on ? 'Expand sidebar' : 'Collapse sidebar');
     }
+  }
+
+  function savedCollapsed() {
+    var saved = localStorage.getItem(STORAGE_KEY);
+    return saved === null ? true : saved === '1';
   }
 
   function init() {
     var btn = document.getElementById('sidebar-toggle');
     if (!btn) return;
 
-    var saved = localStorage.getItem(STORAGE_KEY) === '1';
-    setCollapsed(saved);
+    setCollapsed(savedCollapsed());
 
     btn.addEventListener('click', function () {
       if (isMobile()) return;
-      var next = !document.body.classList.contains('sidebar-collapsed');
-      localStorage.setItem(STORAGE_KEY, next ? '1' : '0');
-      setCollapsed(next);
+      var willCollapse = !isCollapsed();
+      localStorage.setItem(STORAGE_KEY, willCollapse ? '1' : '0');
+      setCollapsed(willCollapse);
     });
 
     window.addEventListener('resize', function () {
-      var collapsed = localStorage.getItem(STORAGE_KEY) === '1';
-      setCollapsed(collapsed);
+      setCollapsed(savedCollapsed());
     });
+
+    var sidebar = document.getElementById('app-sidebar');
+    if (sidebar) {
+      sidebar.addEventListener('transitionend', function (event) {
+        if (event.propertyName === 'width') {
+          window.dispatchEvent(new Event('resize'));
+        }
+      });
+    }
   }
 
   if (document.readyState === 'loading') {
