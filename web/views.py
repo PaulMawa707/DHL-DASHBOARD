@@ -174,6 +174,40 @@ def _parse_multi(values: list[str] | None) -> list[str]:
     return out
 
 
+def _video_lost_active_mask(df: pd.DataFrame, age_hours: float) -> pd.Series:
+    """True only when a device reports video lost while ignition is on and online."""
+    if df is None or df.empty:
+        return pd.Series(dtype=bool)
+    lost = df.get("NotRecordingFlag", pd.Series("", index=df.index)).astype(str).eq("Not Working")
+    ign = df.get("Ignition", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().eq("on")
+    age = (
+        pd.to_numeric(df.get("AgeHours"), errors="coerce")
+        if "AgeHours" in df.columns
+        else pd.Series(float("nan"), index=df.index)
+    )
+    online = age.notna() & (age <= float(age_hours))
+    return lost & ign & online
+
+
+def _with_active_video_lost(df: pd.DataFrame, age_hours: float) -> pd.DataFrame:
+    """Copy of ``df`` with video-lost flags cleared unless ignition is on and online."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    active = _video_lost_active_mask(out, age_hours)
+    if "NotRecordingFlag" in out.columns:
+        out.loc[~active, "NotRecordingFlag"] = "Working"
+    if "videoloststateFormatter" in out.columns:
+        out.loc[~active, "videoloststateFormatter"] = ""
+    if "VideoLostChannels" in out.columns:
+        out.loc[~active, "VideoLostChannels"] = ""
+    for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1):
+        col = f"VideoLost_Ch{n}"
+        if col in out.columns:
+            out.loc[~active, col] = "Working"
+    return out
+
+
 def _filter_realtime(
     df: pd.DataFrame | None,
     *,
@@ -181,6 +215,7 @@ def _filter_realtime(
     statuses: list[str],
     ignitions: list[str],
     ch_filter: str,
+    age_hours: float = 6.0,
 ) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -200,7 +235,8 @@ def _filter_realtime(
         if 1 <= n <= RT_VIDEO_LOST_CHANNEL_MAX:
             col = f"VideoLost_Ch{n}"
             if col in out.columns:
-                out = out[out[col].astype(str) == "Not Working"]
+                flagged = _with_active_video_lost(out, age_hours)
+                out = flagged[flagged[col].astype(str) == "Not Working"]
     return out
 
 
@@ -421,27 +457,41 @@ def realtime_context(
             "age_hours": age_hours,
         }
 
-    f = _filter_realtime(df, fleets=fleets, statuses=statuses, ignitions=ignitions, ch_filter=ch_filter)
+    f = _filter_realtime(
+        df,
+        fleets=fleets,
+        statuses=statuses,
+        ignitions=ignitions,
+        ch_filter=ch_filter,
+        age_hours=age_hours,
+    )
     age = pd.to_numeric(f.get("AgeHours"), errors="coerce") if not f.empty else pd.Series(dtype=float)
     total = len(f)
     online = int((age.notna() & (age <= age_hours)).sum()) if total else 0
     offline = int((age.notna() & (age > age_hours)).sum()) if total else 0
     unknown = int(age.isna().sum()) if total else 0
-    video_lost = int((f.get("NotRecordingFlag", pd.Series(dtype=str)) == "Not Working").sum()) if total else 0
+    video_lost = int(_video_lost_active_mask(f, age_hours).sum()) if total else 0
+    chart_df = _with_active_video_lost(f, age_hours)
 
     kpis = [
         kpi_dict("Devices shown", f"{total:,}", border_accent="#3B82F6"),
         kpi_dict("Online", f"{online:,}", accent="#2E8B57", border_accent="#2E8B57"),
         kpi_dict("Offline", f"{offline:,}", accent=DHL_RED, border_accent=DHL_RED),
-        kpi_dict("Video lost (ch)", f"{video_lost:,}", accent=DHL_YELLOW, border_accent=DHL_YELLOW),
+        kpi_dict(
+            "Video lost (ch)",
+            f"{video_lost:,}",
+            accent=DHL_YELLOW,
+            border_accent=DHL_YELLOW,
+            sub="Ignition on, online only",
+        ),
         kpi_dict("Status unknown", f"{unknown:,}", accent="#999", border_accent="#9CA3AF"),
     ]
 
     chart_map = {
         "online_pie": lambda: C.online_offline_pie(f, age_hours),
         "status_donut": lambda: C.status_type_donut(f),
-        "modules": lambda: C.module_health_bar(f),
-        "channels": lambda: C.channel_health_bar(f),
+        "modules": lambda: C.module_health_bar(chart_df),
+        "channels": lambda: C.channel_health_bar(chart_df),
         "age_hist": lambda: C.age_hours_histogram(f),
         "signal_box": lambda: C.signal_box_by_status(f),
     }
@@ -650,18 +700,22 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
 
 def _build_faults(rt_row: pd.Series, a_dev: pd.DataFrame) -> list[dict]:
     faults: list[dict] = []
+    age = pd.to_numeric(rt_row.get("AgeHours"), errors="coerce")
+    ign_on = str(rt_row.get("Ignition") or "").strip().lower() == "on"
+    online = pd.notna(age) and float(age) <= 6.0
+    video_lost_live = str(rt_row.get("NotRecordingFlag") or "") == "Not Working" and ign_on and online
     modules = [
         ("Mobile network", rt_row.get("MobileNetwork") == "Working"),
         ("GPS", rt_row.get("GPSModule") == "Working"),
         ("G-Sensor", rt_row.get("GsensorModule") == "Working"),
         ("Wi-Fi", rt_row.get("WifiModule") == "Working"),
-        ("Video lost (ch)", rt_row.get("NotRecordingFlag") == "Working"),
+        ("Video lost (ch)", not video_lost_live),
     ]
     for label, ok in modules:
         faults.append({"label": f"{label}: {'OK' if ok else 'FAULT'}", "ok": ok})
 
     video_lost = parse_channels(str(rt_row.get("videoloststateFormatter") or ""))
-    if video_lost:
+    if video_lost and ign_on and online:
         faults.append(
             {
                 "label": f"Video lost on {', '.join(f'CH{c}' for c in sorted(set(video_lost)))}",
