@@ -279,6 +279,12 @@ def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
                 f"Auto-refresh: realtime status complete ({rows} devices)",
             )
             log.info("auto-refresh: realtime status updated (%s devices)", rows)
+            try:
+                import neon_meta_store
+
+                neon_meta_store.record_last_auto_refresh(rows=rows, source="auto")
+            except Exception as meta_exc:  # noqa: BLE001
+                log.debug("auto-refresh: could not store last time: %s", meta_exc)
             return {"refreshed": True, "rows": rows, "age_seconds": 0}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)

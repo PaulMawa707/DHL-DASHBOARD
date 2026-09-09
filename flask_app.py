@@ -149,6 +149,7 @@ def _layout_context(*, active: str, **extra):
         "vss_base_url": active_base_url(),
         "awaiting_vss": cache_get("realtime_status") is None,
         "last_refresh_display": last_saved_refresh_display(),
+        "last_auto_refresh_display": neon_meta_store.last_auto_refresh_display(),
         "realtime_auto_refresh_seconds": realtime_auto_refresh_seconds(),
         "realtime_age_seconds": _realtime_age_for_ui(),
     }
@@ -313,6 +314,7 @@ def api_cache_status():
             },
             "latest_data": cache_latest_data_iso(),
             "last_refresh": last_saved_refresh_display(),
+            "last_auto_refresh": neon_meta_store.last_auto_refresh_display(),
             "last_bust": last_bust_cache_iso(),
             "vss_token_source": last_vss_token_source(),
             "vss_profile": last_vss_profile(),
@@ -335,6 +337,7 @@ def api_cron_realtime():
         result = auto_refresh_realtime(force=True)
         result.setdefault("age_seconds", _realtime_age_for_ui())
         result["interval_seconds"] = realtime_auto_refresh_seconds()
+        result["last_auto_refresh"] = neon_meta_store.last_auto_refresh_display()
         result["ok"] = True
         result["source"] = "cron"
         status = "ok" if result.get("refreshed") or result.get("reason") in ("fresh", "disabled") else "error"
@@ -356,6 +359,7 @@ def api_refresh_realtime():
     result = auto_refresh_realtime()
     result.setdefault("age_seconds", _realtime_age_for_ui())
     result["interval_seconds"] = realtime_auto_refresh_seconds()
+    result["last_auto_refresh"] = neon_meta_store.last_auto_refresh_display()
     return jsonify(result)
 
 

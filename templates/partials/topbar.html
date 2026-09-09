@@ -12,6 +12,10 @@
   </div>
   <div class="topbar-right">
     <div id="topbar-clock" class="topbar-clock"></div>
+    <div id="auto-refresh-status" class="auto-refresh-status"{% if last_auto_refresh_display %} title="Last auto-refresh {{ last_auto_refresh_display.at_display }} (EAT)"{% endif %}>
+      <span class="auto-refresh-label">Auto-refresh</span>
+      <span id="auto-refresh-at">{% if last_auto_refresh_display %}{{ last_auto_refresh_display.at_display }}{% else %}Waiting for first run{% endif %}</span>
+    </div>
     <div class="live-pill"><span class="live-dot"></span> Live</div>
     <button type="button" id="btn-refresh" class="btn-accent">Refresh data</button>
     <button type="button" id="btn-signout" class="btn-logout">Sign out</button>

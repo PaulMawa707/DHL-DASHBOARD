@@ -15,6 +15,7 @@ from psycopg2.extras import Json, RealDictCursor
 log = logging.getLogger("neon_meta_store")
 
 LAST_REFRESH_KEY = "last_refresh"
+LAST_AUTO_REFRESH_KEY = "last_auto_refresh"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -118,9 +119,20 @@ def record_last_refresh(*, counts: dict[str, int], username: str = "", session_i
     log.info("last_refresh recorded at %s counts=%s", now.isoformat(), counts)
 
 
-def last_refresh_display() -> dict[str, Any] | None:
-    """Return last refresh metadata for UI banners."""
-    meta = get_meta(LAST_REFRESH_KEY)
+def record_last_auto_refresh(*, rows: int = 0, source: str = "auto") -> None:
+    now = datetime.now(timezone.utc)
+    set_meta(
+        LAST_AUTO_REFRESH_KEY,
+        {
+            "at": now.isoformat(),
+            "rows": int(rows or 0),
+            "source": source or "auto",
+        },
+    )
+    log.info("last_auto_refresh recorded at %s source=%s rows=%s", now.isoformat(), source, rows)
+
+
+def _display_from_meta(meta: dict[str, Any] | None) -> dict[str, Any] | None:
     if not meta:
         return None
     at_raw = meta.get("at") or meta.get("_updated_at")
@@ -147,4 +159,16 @@ def last_refresh_display() -> dict[str, Any] | None:
         "at_display": local.strftime("%a, %b %d, %Y %H:%M:%S"),
         "counts": meta.get("counts") or {},
         "username": meta.get("username") or "",
+        "source": meta.get("source") or "",
+        "rows": meta.get("rows") or 0,
     }
+
+
+def last_refresh_display() -> dict[str, Any] | None:
+    """Return last full Refresh data metadata for UI banners."""
+    return _display_from_meta(get_meta(LAST_REFRESH_KEY))
+
+
+def last_auto_refresh_display() -> dict[str, Any] | None:
+    """Return last 30-minute auto-refresh metadata for the top bar."""
+    return _display_from_meta(get_meta(LAST_AUTO_REFRESH_KEY))

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css', v='20260908s') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css', v='20260909a') }}">
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <script src="{{ url_for('static', filename='filters.js') }}" defer></script>
   <script src="{{ url_for('static', filename='tables.js') }}" defer></script>
@@ -55,6 +55,26 @@
     }
     updateClock();
     setInterval(updateClock, 1000);
+
+    function applyAutoRefreshStatus(info) {
+      const el = document.getElementById('auto-refresh-at');
+      if (!el || !info || !info.at_display) return;
+      el.textContent = info.at_display;
+      const wrap = document.getElementById('auto-refresh-status');
+      if (wrap) wrap.title = 'Last auto-refresh ' + info.at_display + ' (EAT)';
+    }
+
+    async function pollAutoRefreshTime() {
+      if (window.__dashboardRefreshRunning) return;
+      try {
+        const r = await fetch('/api/cache/status', { credentials: 'same-origin' });
+        if (!r.ok) return;
+        const data = await r.json();
+        applyAutoRefreshStatus(data.last_auto_refresh);
+      } catch (_) {}
+    }
+    pollAutoRefreshTime();
+    setInterval(pollAutoRefreshTime, 30000);
 
     async function refreshCacheStatus() {
       try {
@@ -105,6 +125,7 @@
             ageAtLoad = data.age_seconds;
             measuredAt = Date.now();
           }
+          applyAutoRefreshStatus(data.last_auto_refresh);
           if (data.refreshed) {
             window.dashboardClearPageCache?.();
             window.dashboardNavigateTo?.(window.location.href, {
