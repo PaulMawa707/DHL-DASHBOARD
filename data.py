@@ -295,9 +295,10 @@ def bust_cache_for_refresh(*, keep_devices: bool = False, clear_mix_disk_catalog
     """
     global _last_full_bust_at
     try:
-        from mix_client import clear_tacho_cache
+        from mix_client import clear_org_groups_cache, clear_tacho_cache
 
         clear_tacho_cache()
+        clear_org_groups_cache()
     except Exception:
         pass
     with _cache_lock:
@@ -329,9 +330,9 @@ def cache_put(key: str, value: Any) -> None:
 
 def _snapshot_max_age_seconds() -> float:
     try:
-        hours = float(os.environ.get("NEON_SNAPSHOT_MAX_HOURS", "72") or "72")
+        hours = float(os.environ.get("NEON_SNAPSHOT_MAX_HOURS", "168") or "168")
     except ValueError:
-        hours = 72.0
+        hours = 168.0
     return max(1.0, hours) * 3600.0
 
 
@@ -384,6 +385,34 @@ def hydrate_cache_from_neon() -> dict[str, int]:
     return counts
 
 
+def hydrate_missing_snapshots_from_neon(
+    *,
+    exclude_keys: frozenset[str] | set[str] | None = None,
+) -> dict[str, int]:
+    """Fill only missing Neon-backed cache keys (used after partial refresh failures)."""
+    skip = set(exclude_keys or ())
+    counts: dict[str, int] = {}
+    for key in sorted(_NEON_SNAPSHOT_KEYS):
+        if key in skip:
+            continue
+        if cache_peek(key) is not None:
+            continue
+        val = _cache_from_neon_snapshot(key, ignore_max_age=True)
+        if isinstance(val, pd.DataFrame):
+            counts[key] = len(val)
+    return counts
+
+
+def snapshot_counts_from_cache() -> dict[str, int]:
+    """Row counts for Neon-backed cache keys currently in memory."""
+    counts: dict[str, int] = {}
+    for key in sorted(_NEON_SNAPSHOT_KEYS):
+        val = cache_peek(key)
+        if isinstance(val, pd.DataFrame):
+            counts[key] = len(val)
+    return counts
+
+
 def cache_needs_hydration() -> bool:
     """True when none of the Neon-backed cache keys are populated."""
     with _cache_lock:
@@ -420,10 +449,18 @@ def cache_get(key: str, ttl: int = TTL_SECONDS) -> Any:
     with _cache_lock:
         entry = _cache.get(key)
     if not entry:
-        return _cache_from_neon_snapshot(key)
+        val = _cache_from_neon_snapshot(key)
+        if val is not None:
+            return val
+        return _cache_from_neon_snapshot(key, ignore_max_age=True)
     if time.time() - entry.at >= ttl:
         snap = _cache_from_neon_snapshot(key)
-        return snap if snap is not None else None
+        if snap is not None:
+            return snap
+        stale_neon = _cache_from_neon_snapshot(key, ignore_max_age=True)
+        if stale_neon is not None:
+            return stale_neon
+        return entry.value
     return entry.value
 
 
@@ -893,7 +930,7 @@ def _alarm_device_canonical_map(devices_df: pd.DataFrame) -> dict[str, str]:
 _STATUS_TYPE_MAP = {
     1: "Normal",
     2: "Offline Long Time",
-    3: "Storage Error",
+    3: "Disk loss",
     4: "Disk Failure",
     5: "Power Off",
     6: "GPS Failure",
@@ -992,6 +1029,122 @@ def _parse_state_json(raw: dict) -> dict:
     return {}
 
 
+# VSS Disk Failure Record — storage abnormal (type 16), status st=0 is disk / SD loss.
+_STORAGE_ABNORMAL_ALARM_CODE = "16"
+_DISK_LOSS_ALARM_LABEL = "SD card missing"
+_STORAGE_ERROR_ALARM_LABEL = "Storage error"
+
+_PLATE_RE = re.compile(r"[A-Z]{3}\s?\d{3}\s?[A-Z]", re.I)
+
+
+def normalize_vehicle_registration(value: str) -> str:
+    """Normalize a Kenyan-style plate from VSS device name or MiX registration."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = _PLATE_RE.search(text.upper())
+    if match:
+        return re.sub(r"\s+", "", match.group(0))
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def _disk_loss_from_state(state: dict) -> tuple[bool, str]:
+    """Detect disk loss from live VSS stateJson (Disk Failure Record / storage module)."""
+    if not isinstance(state, dict):
+        return False, ""
+
+    module = state.get("module")
+    if isinstance(module, dict):
+        record_mod = module.get("record")
+        if record_mod is not None:
+            try:
+                if int(record_mod) == 3:
+                    return True, "Recording module: disk not detected"
+            except (TypeError, ValueError):
+                pass
+
+    storage = state.get("storage")
+    if storage is None and isinstance(state.get("basic"), dict):
+        storage = state["basic"].get("storage")
+    if not isinstance(storage, list):
+        return False, ""
+
+    loss_labels: list[str] = []
+    for item in storage:
+        if not isinstance(item, dict):
+            continue
+        idx = str(item.get("index", item.get("num", "?")))
+        try:
+            status = int(item.get("status", -1))
+        except (TypeError, ValueError):
+            continue
+        total_raw = str(item.get("total", "")).strip()
+        # VSS storage abnormal detail: st=0 is disk loss; live storage status 0 with no capacity.
+        if status == 0 and total_raw in ("", "0"):
+            loss_labels.append(idx)
+    if loss_labels:
+        return True, f"Disk loss ({', '.join(loss_labels)})"
+    return False, ""
+
+
+def _parse_storage_alarm_disk_loss(alarmvalue: str) -> tuple[bool, str]:
+    """Parse storage-abnormal alarm payload; st=0 means disk loss per VSS API."""
+    raw = str(alarmvalue or "").strip()
+    if not raw:
+        return False, ""
+
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                st = obj.get("st", obj.get("status"))
+                num = obj.get("num") or obj.get("numbering") or "disk"
+                if str(st) == "0":
+                    return True, f"{num}: disk loss"
+                return False, ""
+        except json.JSONDecodeError:
+            pass
+
+    if re.search(r"\bst\s*[:=]\s*0\b", raw, re.I):
+        num_match = re.search(r"num\s*[:=]\s*(\w+)", raw, re.I)
+        num = num_match.group(1) if num_match else "disk"
+        return True, f"{num}: disk loss"
+    return False, ""
+
+
+def _is_storage_abnormal_alarm(code: str, name: str) -> bool:
+    code_s = str(code or "").strip()
+    name_l = _normalize_label(name)
+    if code_s == _STORAGE_ABNORMAL_ALARM_CODE:
+        return True
+    return name_l in ("storage error", "storage abnormal", "disk loss", "sd card missing")
+
+
+def find_mix_asset_for_vss_device(
+    *,
+    device_name: str,
+    mix_df: pd.DataFrame | None = None,
+) -> pd.Series | None:
+    """Match a VSS device to a MiX health row by normalized registration/plate."""
+    reg = normalize_vehicle_registration(device_name)
+    if not reg:
+        return None
+
+    if mix_df is None:
+        mix_df = cache_peek("mix_health")
+    if not isinstance(mix_df, pd.DataFrame) or mix_df.empty:
+        return None
+
+    for col in ("Registration", "AssetName"):
+        if col not in mix_df.columns:
+            continue
+        for _, row in mix_df.iterrows():
+            candidate = normalize_vehicle_registration(str(row.get(col, "")))
+            if candidate and candidate == reg:
+                return row
+    return None
+
+
 def _normalize_realtime_row(raw: dict, baseline_by_id: dict[str, dict]) -> dict:
     dev_raw = _row_str(raw, "deviceguid", "deviceID", "deviceid", "deviceno")
     k = str(dev_raw).strip()
@@ -1030,6 +1183,9 @@ def _normalize_realtime_row(raw: dict, baseline_by_id: dict[str, dict]) -> dict:
     not_recording_flag = "Not Working" if lost_channels else "Working"
     video_lost_by_ch = {n: ("Not Working" if n in lost_channels else "Working") for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)}
 
+    disk_loss, disk_loss_detail = _disk_loss_from_state(state)
+    disk_loss_flag = "Not Working" if disk_loss else "Working"
+
     if age_hours is None:
         status_type = "Status Unknown"
     elif age_hours > 168:
@@ -1052,6 +1208,8 @@ def _normalize_realtime_row(raw: dict, baseline_by_id: dict[str, dict]) -> dict:
         "GsensorModule": _module_flag(module, "gsensor"),
         "WifiModule": _module_flag(module, "wifi"),
         "NotRecordingFlag": not_recording_flag,
+        "DiskLossFlag": disk_loss_flag,
+        "DiskLossDetail": disk_loss_detail,
         "VideoLostChannels": ",".join(str(c) for c in sorted(set(lost_channels))),
         **{f"VideoLost_Ch{n}": video_lost_by_ch[n] for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)},
         "recordstateFormatter": record_state_fmt,
@@ -1074,9 +1232,9 @@ def _realtime_baseline_from_devices(devices_df: pd.DataFrame) -> pd.DataFrame:
     empty_extra = ["VideoLostChannels"] + [f"VideoLost_Ch{n}" for n in range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1)]
     for col in [
         "Time", "AgeHours", "Ignition", "MobileNetwork", "GPSModule", "GsensorModule",
-        "WifiModule", "NotRecordingFlag", *empty_extra, "recordstateFormatter", "videoloststateFormatter",
-        "videomaskstateFormatter", "netType", "signalValue", "cpuTemp", "diskTemp",
-        "devVoltage", "batVoltage", "StatusType",
+        "WifiModule", "NotRecordingFlag", "DiskLossFlag", "DiskLossDetail", *empty_extra,
+        "recordstateFormatter", "videoloststateFormatter", "videomaskstateFormatter", "netType",
+        "signalValue", "cpuTemp", "diskTemp", "devVoltage", "batVoltage", "StatusType",
     ]:
         merged[col] = pd.Series(dtype="object")
     merged["StatusType"] = "Status Unknown"
@@ -1139,7 +1297,8 @@ TARGET_ALARMS: list[str] = [
     "Rollover",
     "Camera Covered",
     "Video Lost",
-    "Storage Error",
+    _DISK_LOSS_ALARM_LABEL,
+    _STORAGE_ERROR_ALARM_LABEL,
     "Low Voltage Alarm",
     "Power Down During Driving",
     "Vehicle Offline for a Long Time",
@@ -1173,14 +1332,20 @@ def _target_alarm_codes() -> list[str]:
     missing: list[str] = []
     for label in TARGET_ALARMS:
         code = label_to_code.get(label.lower())
+        if not code and label in (_DISK_LOSS_ALARM_LABEL, _STORAGE_ERROR_ALARM_LABEL):
+            # Disk / SD / storage-abnormal (type 16); lang may say "Storage Error".
+            code = label_to_code.get("storage error") or label_to_code.get("storage abnormal")
         if code:
             codes.append(code)
         else:
             missing.append(label)
+    if _DISK_LOSS_ALARM_LABEL in missing or _STORAGE_ERROR_ALARM_LABEL in missing:
+        codes.append(_STORAGE_ABNORMAL_ALARM_CODE)
+        missing = [m for m in missing if m not in {_DISK_LOSS_ALARM_LABEL, _STORAGE_ERROR_ALARM_LABEL}]
     if missing:
         # Not fatal: API will return all types, pandas filter still scopes by name.
         print("WARN: no alarm code found in lang dict for:", missing)
-    return codes
+    return list(dict.fromkeys(codes))
 
 
 def _normalize_label(s: str) -> str:
@@ -1188,6 +1353,24 @@ def _normalize_label(s: str) -> str:
 
 
 _TARGET_ALARM_NORMALIZED = {_normalize_label(a) for a in TARGET_ALARMS}
+
+_ALARM_NAME_ALIASES = {
+    "storage error": _STORAGE_ERROR_ALARM_LABEL,
+    "storage abnormal": _STORAGE_ERROR_ALARM_LABEL,
+    "disk loss": _DISK_LOSS_ALARM_LABEL,
+    "sd card missing": _DISK_LOSS_ALARM_LABEL,
+}
+
+
+def canonical_alarm_name(name: str) -> str:
+    """Map API/lang labels (e.g. Storage Error, Disk loss) to dashboard labels."""
+    norm = _normalize_label(name)
+    if norm in _ALARM_NAME_ALIASES:
+        return _ALARM_NAME_ALIASES[norm]
+    for target in TARGET_ALARMS:
+        if _normalize_label(target) == norm:
+            return target
+    return str(name or "").strip()
 
 
 def _load_alarms_last_hours(hours: int) -> pd.DataFrame:
@@ -1315,27 +1498,63 @@ def _load_alarms_last_hours(hours: int) -> pd.DataFrame:
     df["Speed"] = pd.to_numeric(df.get("speed"), errors="coerce")
     df["PlateNo"] = df.get("plateNo", "").astype(str)
 
-    # Final scope: keep only the 8 alarm types asked for, even if the API returned extras.
-    # We canonicalise the AlarmName to the exact label from TARGET_ALARMS so downstream
-    # filters/charts get clean values.
+    alarmvalue_col = None
+    for col in ("alarmvalue", "alarmValue", "AlarmValue"):
+        if col in df.columns:
+            alarmvalue_col = col
+            break
+
+    # Storage abnormal: st=0 is SD / disk missing; other payloads stay Storage error.
+    if alarmvalue_col:
+        classified_names: list[str] = []
+        disk_details: list[str] = []
+        for _, row in df.iterrows():
+            code = str(row.get("AlarmCode", "")).strip()
+            name = str(row.get("AlarmName", "")).strip()
+            if _is_storage_abnormal_alarm(code, name):
+                is_loss, detail = _parse_storage_alarm_disk_loss(str(row.get(alarmvalue_col, "")))
+                if is_loss:
+                    classified_names.append(_DISK_LOSS_ALARM_LABEL)
+                    disk_details.append(detail)
+                else:
+                    classified_names.append(_STORAGE_ERROR_ALARM_LABEL)
+                    disk_details.append("")
+            else:
+                classified_names.append(name)
+                disk_details.append("")
+        df["AlarmName"] = classified_names
+        df["DiskLossDetail"] = disk_details
+    else:
+        df["DiskLossDetail"] = ""
+
+    # Final scope: keep only the target alarm types, even if the API returned extras.
+    # We canonicalise the AlarmName so downstream filters/charts get clean values.
     canonical_by_norm = {_normalize_label(a): a for a in TARGET_ALARMS}
+    canonical_by_norm.setdefault("storage error", _STORAGE_ERROR_ALARM_LABEL)
+    canonical_by_norm.setdefault("storage abnormal", _STORAGE_ERROR_ALARM_LABEL)
+    canonical_by_norm.setdefault("disk loss", _DISK_LOSS_ALARM_LABEL)
     df["_norm"] = df["AlarmName"].map(_normalize_label)
-    df = df[df["_norm"].isin(_TARGET_ALARM_NORMALIZED)].copy()
+    allowed = set(_TARGET_ALARM_NORMALIZED) | {
+        _normalize_label(_DISK_LOSS_ALARM_LABEL),
+        _normalize_label(_STORAGE_ERROR_ALARM_LABEL),
+    }
+    df = df[df["_norm"].isin(allowed)].copy()
     if not df.empty:
         df["AlarmName"] = df["_norm"].map(canonical_by_norm)
     df = df.drop(columns=["_norm"], errors="ignore")
 
     keep = [
         "DeviceID", "DeviceName", "Fleet", "AlarmCode", "AlarmName",
-        "AlarmTime", "Lat", "Lon", "Speed", "PlateNo",
+        "AlarmTime", "Lat", "Lon", "Speed", "PlateNo", "DiskLossDetail",
     ]
+    keep = [c for c in keep if c in df.columns]
     return df[keep].sort_values("AlarmTime", ascending=False).reset_index(drop=True)
 
 
 def _empty_alarms_dataframe() -> pd.DataFrame:
     return pd.DataFrame(columns=[
         "DeviceID", "DeviceName", "Fleet", "AlarmCode", "AlarmName",
-        "AlarmTime", "Lat", "Lon", "Speed", "PlateNo",
+        "AlarmTime", "Lat", "Lon", "Speed", "PlateNo", "DiskLossDetail",
     ])
 
 

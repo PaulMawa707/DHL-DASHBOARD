@@ -8,6 +8,11 @@
 {% call filter_panel() %}
   {{ filter_multi('fleet', 'Fleet', fleet_opts, fleets) }}
   {{ filter_multi('alarm_type', 'Alarm type', type_opts, alarm_types) }}
+  {{ filter_select('severity', 'Severity', [
+    {'value': 'all', 'label': 'All'},
+    {'value': 'high', 'label': 'High'},
+    {'value': 'critical', 'label': 'Critical'},
+  ], severity) }}
   {{ filter_select('chart', 'Chart', [
     {'value': 'type_pie', 'label': 'By type (pie)'},
     {'value': 'per_hour', 'label': 'Per hour'},
