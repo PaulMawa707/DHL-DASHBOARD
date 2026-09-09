@@ -14,5 +14,11 @@
       "src": "/(.*)",
       "dest": "flask_app.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/realtime",
+      "schedule": "*/30 * * * *"
+    }
   ]
 }

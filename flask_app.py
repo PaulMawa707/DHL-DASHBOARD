@@ -73,7 +73,7 @@ from vss_client import (  # noqa: E402
     last_vss_profile,
     last_vss_token_source,
 )
-from web.auth import login_required, verify_login  # noqa: E402
+from web.auth import cron_request_authorized, login_required, verify_login  # noqa: E402
 from web.prewarm import (  # noqa: E402
     auto_refresh_realtime,
     prewarm_cache_sync,
@@ -112,7 +112,7 @@ def hydrate_dashboard_cache():
     path = request.path or ""
     if not path.startswith("/dashboard") and not path.startswith("/api/"):
         return None
-    if path.startswith("/api/logs") or path in ("/api/logout", "/api/refresh"):
+    if path.startswith("/api/logs") or path.startswith("/api/cron/") or path in ("/api/logout", "/api/refresh"):
         return None
     if cache_needs_hydration():
         try:
@@ -322,6 +322,31 @@ def api_cache_status():
             "realtime_auto_refresh_seconds": realtime_auto_refresh_seconds(),
         }
     )
+
+
+@app.route("/api/cron/realtime", methods=["GET", "POST"])
+def api_cron_realtime():
+    """Vercel Cron (and local timer) entrypoint: refresh realtime on a 30-minute schedule."""
+    if not cron_request_authorized():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    log_sid = operation_log.start_session("refresh", username="cron")
+    operation_log.set_current_session(log_sid)
+    try:
+        result = auto_refresh_realtime(force=True)
+        result.setdefault("age_seconds", _realtime_age_for_ui())
+        result["interval_seconds"] = realtime_auto_refresh_seconds()
+        result["ok"] = True
+        result["source"] = "cron"
+        status = "ok" if result.get("refreshed") or result.get("reason") in ("fresh", "disabled") else "error"
+        operation_log.end_session(
+            log_sid,
+            status,
+            message=f"Cron realtime refresh: refreshed={result.get('refreshed')} reason={result.get('reason')}",
+        )
+        return jsonify(result)
+    except Exception as exc:  # noqa: BLE001
+        operation_log.end_session(log_sid, "error", message=f"Cron realtime refresh failed: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/api/refresh/realtime", methods=["POST"])

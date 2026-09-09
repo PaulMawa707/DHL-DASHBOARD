@@ -289,6 +289,36 @@ def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
         _auto_realtime_lock.release()
 
 
+_local_cron_started = False
+
+
+def _start_local_realtime_cron() -> None:
+    """In-process 30-minute timer for local Flask. Vercel uses vercel.json crons."""
+    global _local_cron_started
+    if os.environ.get("VERCEL", "").strip():
+        return
+    interval = realtime_auto_refresh_seconds()
+    if interval <= 0 or _local_cron_started:
+        return
+    _local_cron_started = True
+
+    def _loop() -> None:
+        log.info("local realtime cron: every %s minutes", max(1, interval // 60))
+        while True:
+            time.sleep(interval)
+            try:
+                result = auto_refresh_realtime(force=True)
+                log.info(
+                    "local realtime cron: refreshed=%s reason=%s",
+                    result.get("refreshed"),
+                    result.get("reason"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("local realtime cron failed: %s", exc)
+
+    threading.Thread(target=_loop, name="dhl-realtime-cron", daemon=True).start()
+
+
 def start_background_workers() -> None:
     """Startup: hydrate display cache from Neon only — no VSS/MiX API calls."""
     try:
@@ -299,3 +329,4 @@ def start_background_workers() -> None:
             log.info("startup: dashboard cache hydrated from Neon")
     except Exception as e:  # noqa: BLE001
         log.warning("startup Neon hydrate skipped: %s", e)
+    _start_local_realtime_cron()
