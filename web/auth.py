@@ -26,13 +26,15 @@ def verify_login(username: str, password: str) -> bool:
 
 
 def cron_request_authorized() -> bool:
-    """Allow Vercel Cron (Bearer CRON_SECRET) or unauthenticated local Flask."""
+    """Allow Vercel Cron, an optional Bearer secret, or local Flask."""
     secret = _env("CRON_SECRET") or _env("DHL_CRON_SECRET")
     auth = (request.headers.get("Authorization") or "").strip()
     if secret:
         return auth == f"Bearer {secret}"
-    # Refuse anonymous cron hits on Vercel if no secret is configured.
-    return os.environ.get("VERCEL", "").strip() != "1"
+    if os.environ.get("VERCEL", "").strip() == "1":
+        # Vercel Cron always sends this. Set CRON_SECRET to require a Bearer token.
+        return (request.headers.get("x-vercel-cron") or "").strip() == "1"
+    return True
 
 
 def login_required(view):
