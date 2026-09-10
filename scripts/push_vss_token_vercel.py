@@ -49,16 +49,31 @@ def _load_dotenv(path: Path) -> None:
 
 
 def _vercel_config() -> tuple[str, str | None]:
-    project_id = os.environ.get("VERCEL_PROJECT_ID", "").strip()
-    org_id = os.environ.get("VERCEL_ORG_ID", "").strip() or None
+    """Resolve the linked mix-vss project.
+
+    ``.vercel/project.json`` wins over ``VERCEL_PROJECT_ID`` so a stale GitHub
+    secret cannot send tokens to a different Vercel project.
+    """
+    file_project = ""
+    file_org: str | None = None
     project_file = ROOT / ".vercel" / "project.json"
     if project_file.is_file():
         data = json.loads(project_file.read_text(encoding="utf-8"))
-        project_id = project_id or str(data.get("projectId") or "").strip()
-        org_id = org_id or str(data.get("orgId") or "").strip() or None
-    if not project_id:
+        file_project = str(data.get("projectId") or "").strip()
+        file_org = str(data.get("orgId") or "").strip() or None
+
+    env_project = os.environ.get("VERCEL_PROJECT_ID", "").strip()
+    env_org = os.environ.get("VERCEL_ORG_ID", "").strip() or None
+    if file_project:
+        if env_project and env_project != file_project:
+            print(
+                f"Ignoring VERCEL_PROJECT_ID={env_project[:16]}…; "
+                f"using .vercel/project.json ({file_project[:16]}…)"
+            )
+        return file_project, file_org or env_org
+    if not env_project:
         raise RuntimeError("VERCEL_PROJECT_ID is not set and .vercel/project.json is missing")
-    return project_id, org_id
+    return env_project, env_org
 
 
 def _vercel_api_token() -> str | None:
@@ -77,6 +92,8 @@ def _vercel_cli_base() -> list[str]:
     import shutil
     import sys
 
+    scope = os.environ.get("VERCEL_SCOPE", "").strip()
+
     node = shutil.which("node")
     if sys.platform == "win32" and node:
         for root in (
@@ -86,12 +103,10 @@ def _vercel_cli_base() -> list[str]:
             vc = root / "node_modules" / "vercel" / "dist" / "vc.js"
             if vc.is_file():
                 cmd = [node, str(vc)]
-                scope = os.environ.get("VERCEL_SCOPE", "stephens-projects-f12720f1").strip()
                 if scope:
                     cmd.extend(["--scope", scope])
                 return cmd
     cmd = ["vercel"]
-    scope = os.environ.get("VERCEL_SCOPE", "stephens-projects-f12720f1").strip()
     if scope:
         cmd.extend(["--scope", scope])
     return cmd
@@ -148,6 +163,52 @@ def upsert_vercel_env_cli(*, key: str, value: str, targets: tuple[str, ...] = DE
         )
         add.check_returncode()
         print(f"Updated Vercel env {key} ({target}) via CLI")
+
+
+def delete_vercel_env(*, key: str, targets: tuple[str, ...] = DEFAULT_TARGETS) -> None:
+    """Remove an env var from Vercel for the given deployment targets."""
+    vercel_token = _vercel_api_token()
+    if not vercel_token:
+        for target in targets:
+            rm = subprocess.run(
+                [*_vercel_cli_base(), "env", "rm", key, target, "--yes"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+            )
+            if rm.returncode not in (0, 1):
+                rm.check_returncode()
+            print(f"Removed Vercel env {key} ({target}) via CLI")
+        return
+
+    project_id, org_id = _vercel_config()
+    params = _vercel_params(org_id)
+    headers = _vercel_headers(vercel_token)
+    resp = requests.get(
+        f"https://api.vercel.com/v9/projects/{project_id}/env",
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    target_set = set(targets)
+    for item in resp.json().get("env", []):
+        if item.get("key") != key:
+            continue
+        item_targets = set(item.get("target") or [])
+        if item_targets and not (item_targets & target_set):
+            continue
+        env_id = item.get("id")
+        if not env_id:
+            continue
+        delete = requests.delete(
+            f"https://api.vercel.com/v9/projects/{project_id}/env/{env_id}",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        delete.raise_for_status()
+        print(f"Removed Vercel env {key} ({', '.join(sorted(item_targets or target_set))})")
 
 
 def upsert_vercel_env(*, key: str, value: str, targets: tuple[str, ...] = DEFAULT_TARGETS) -> None:
@@ -222,11 +283,45 @@ def local_token_age_hours() -> float | None:
     return (datetime.now(timezone.utc) - issued).total_seconds() / 3600.0
 
 
+def neon_token_age_hours() -> float | None:
+    """Age of the token production cron actually uses (Neon), not Vercel env."""
+    try:
+        from neon_token_store import configured, load_vss_token
+    except Exception:
+        return None
+    if not configured():
+        return None
+    try:
+        row = load_vss_token()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not read Neon token age ({exc})")
+        return None
+    if not row:
+        return None
+    issued = row.get("issued_at")
+    if not isinstance(issued, datetime):
+        return None
+    if issued.tzinfo is None:
+        issued = issued.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - issued).total_seconds() / 3600.0
+
+
 def should_skip_refresh(*, force: bool) -> bool:
     if force:
         return False
 
     threshold = _token_ttl_hours() - _refresh_lead_hours()
+
+    neon_age = neon_token_age_hours()
+    if neon_age is not None:
+        if neon_age < threshold:
+            print(
+                f"Skip: Neon VSS token was updated {neon_age:.1f}h ago "
+                f"(refresh threshold {threshold:.1f}h)"
+            )
+            return True
+        print(f"Neon VSS token is {neon_age:.1f}h old — refreshing")
+        return False
 
     try:
         vercel_age = vercel_env_age_hours("VSS_TOKEN")
@@ -266,8 +361,7 @@ def acquire_fresh_token(*, force: bool) -> tuple[str, str]:
         validate_or_renew_token,
     )
 
-    if not neon_configured():
-        raise RuntimeError("NEON_DB_URL is required — set it in .env or the CI environment")
+    neon_ok = neon_configured()
 
     if not force:
         cached = try_token_without_login()
@@ -286,12 +380,15 @@ def acquire_fresh_token(*, force: bool) -> tuple[str, str]:
     )
     if not _token_is_live(token):
         raise RuntimeError("VSS login succeeded but the new token failed validation")
-    _save_token_to_file(token, pid)
-    row = load_vss_token()
-    if not row or row.get("token") != token:
-        raise RuntimeError("VSS token was not persisted to Neon after apiLogin")
-    print(f"VSS token verified in Neon (pid={ (row.get('pid') or '')[:12] }…)")
-    print("VSS apiLogin OK — token saved to Neon and ready for Vercel")
+    if neon_ok:
+        _save_token_to_file(token, pid)
+        row = load_vss_token()
+        if not row or row.get("token") != token:
+            raise RuntimeError("VSS token was not persisted to Neon after apiLogin")
+        print(f"VSS token verified in Neon (pid={ (row.get('pid') or '')[:12] }…)")
+        print("VSS apiLogin OK — token saved to Neon and ready for Vercel")
+    else:
+        print("NEON_DB_URL not set locally — pushing token to Vercel only (skipping Neon save)")
     return token, pid or ""
 
 
