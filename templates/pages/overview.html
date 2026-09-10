@@ -7,7 +7,7 @@
 {{ render_banners(banners) }}
 
 {% call filter_panel() %}
-  {{ filter_number('age_hours', 'Age threshold (hours)', age_hours) }}
+  {{ filter_number('age_hours', 'Online if last seen within (h)', age_hours, min=0.25, max=72, step=0.25) }}
   {{ filter_submit('Apply') }}
 {% endcall %}
 

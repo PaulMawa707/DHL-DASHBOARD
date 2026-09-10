@@ -45,9 +45,43 @@ except ImportError:  # Production image may not include the camera proxy yet.
 from mix_health import ALL_ISSUES
 from web.alerts import annotate_alarms, annotate_realtime, build_device_severity, severity_counts
 from web.charts import figure_html
+from web.prewarm import realtime_auto_refresh_seconds
 
 DHL_RED = C.DHL_RED
 DHL_YELLOW = C.DHL_YELLOW
+
+# Watchlist "offline" stays a long-idle flag; Online/Offline KPIs use the cron window.
+WATCHLIST_AGE_HOURS = 6.0
+
+
+def online_offline_age_hours() -> float:
+    """Online if the last VSS report is within one realtime auto-refresh interval."""
+    secs = realtime_auto_refresh_seconds()
+    if secs <= 0:
+        return 0.5
+    return secs / 3600.0
+
+
+def parse_online_age_hours(raw: str | None) -> float:
+    default = online_offline_age_hours()
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if val <= 0:
+        return default
+    return val
+
+
+def format_online_window(hours: float) -> str:
+    minutes = float(hours) * 60.0
+    if minutes < 59.5:
+        return f"{minutes:g} min"
+    if float(hours).is_integer():
+        return f"{int(hours)}h"
+    return f"{hours:g}h"
 
 
 def _sync_load_on_page() -> bool:
@@ -242,8 +276,10 @@ def _filter_realtime(
     statuses: list[str],
     ignitions: list[str],
     ch_filter: str,
-    age_hours: float = 6.0,
+    age_hours: float | None = None,
 ) -> pd.DataFrame:
+    if age_hours is None or age_hours <= 0:
+        age_hours = online_offline_age_hours()
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -466,7 +502,9 @@ def db_data_banner() -> str:
     return "Showing last saved data from database — click Refresh data to update."
 
 
-def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
+def overview_context(*, age_hours: float | None = None) -> dict[str, Any]:
+    if age_hours is None or age_hours <= 0:
+        age_hours = online_offline_age_hours()
     devices = _devices_df()
     rt = _realtime_df()
     alarms = _alarms_df()
@@ -495,13 +533,13 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
 
     kpis = [
         kpi_dict("Total devices (VSS)", f"{total_devices:,}", border_accent="#3B82F6"),
-        kpi_dict("Online", f"{online:,}", accent="#2E8B57", border_accent="#2E8B57", sub=f"<= {age_hours:g}h since last status"),
-        kpi_dict("Offline", f"{offline:,}", accent=DHL_RED, border_accent=DHL_RED, sub=f"> {age_hours:g}h or no signal"),
+        kpi_dict("Online", f"{online:,}", accent="#2E8B57", border_accent="#2E8B57", sub=f"Last seen ≤ {format_online_window(age_hours)}"),
+        kpi_dict("Offline", f"{offline:,}", accent=DHL_RED, border_accent=DHL_RED, sub=f"No report in {format_online_window(age_hours)}"),
         kpi_dict("Status unknown", f"{unknown:,}", accent="#999", border_accent="#9CA3AF"),
         kpi_dict(alarms_kpi_label(), f"{total_alarms:,}", accent=DHL_YELLOW, border_accent=DHL_YELLOW),
         kpi_dict("Devices alarming", f"{devices_with_alarm:,}", accent=DHL_RED, border_accent="#DC2626"),
     ]
-    sev_map = _device_severity_map(age_hours=age_hours)
+    sev_map = _device_severity_map(age_hours=WATCHLIST_AGE_HOURS)
     kpis.extend(_severity_kpis(sev_map))
 
     if mix_integration_enabled():
@@ -551,7 +589,7 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
 
     return {
         "title": "Fleet Overview",
-        "subtitle": "Live snapshot of fleet health — devices, status, and alarms.",
+        "subtitle": f"Live snapshot of fleet health — online/offline uses the {format_online_window(age_hours)} status refresh.",
         "banners": banners,
         "kpis": kpis,
         "charts": charts,
@@ -561,13 +599,15 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
 
 def realtime_context(
     *,
-    age_hours: float = 6.0,
+    age_hours: float | None = None,
     fleets: list[str] | None = None,
     statuses: list[str] | None = None,
     ignitions: list[str] | None = None,
     ch_filter: str = "all",
     chart: str = "online_pie",
 ) -> dict[str, Any]:
+    if age_hours is None or age_hours <= 0:
+        age_hours = online_offline_age_hours()
     df = _realtime_df()
     fleets = _parse_multi(fleets)
     statuses = _parse_multi(statuses)
@@ -625,7 +665,7 @@ def realtime_context(
     video_lost = int(_video_lost_active_mask(f, age_hours).sum()) if total else 0
     chart_df = _with_active_video_lost(f, age_hours)
     view = _realtime_request_view()
-    sev_map = _device_severity_map(age_hours=age_hours)
+    sev_map = _device_severity_map(age_hours=WATCHLIST_AGE_HOURS)
     f_ids = set(f["DeviceID"].astype(str)) if total else set()
     high_ids = {str(did) for did, rec in sev_map.items() if rec.get("severity") == "High"}
     crit_ids = {str(did) for did, rec in sev_map.items() if rec.get("severity") == "Critical"}
@@ -648,6 +688,7 @@ def realtime_context(
             f"{online:,}",
             accent="#2E8B57",
             border_accent="#2E8B57",
+            sub=f"Last seen in the last {format_online_window(age_hours)}",
             href=_href("online"),
             active=view == "online",
         ),
@@ -656,6 +697,7 @@ def realtime_context(
             f"{offline:,}",
             accent=DHL_RED,
             border_accent=DHL_RED,
+            sub=f"No report in the last {format_online_window(age_hours)}",
             href=_href("offline"),
             active=view == "offline",
         ),
@@ -751,7 +793,10 @@ def realtime_context(
 
     return {
         "title": "Real-Time Device Status",
-        "subtitle": "Click a KPI card to fill the table with those vehicles. Click it again to show all.",
+        "subtitle": (
+            f"Online/offline uses the {format_online_window(age_hours)} status refresh. "
+            "Click a KPI card to fill the table; click it again to show all."
+        ),
         "loading": False,
         "kpis": kpis,
         "chart_html": figure_html(fig),
@@ -1009,7 +1054,7 @@ def camera_context(
                 kpis.append(kpi_dict("Last report (h)", f"{float(age):.1f}"))
             lost = str(rt_row.get("VideoLostChannels") or "").strip()
             ign_on = str(rt_row.get("Ignition") or "").strip().lower() == "on"
-            online = pd.notna(age) and float(age) <= 6.0
+            online = pd.notna(age) and float(age) <= online_offline_age_hours()
             if lost and ign_on and online:
                 kpis.append(kpi_dict("Video lost (RT)", lost, accent=DHL_RED, border_accent=DHL_RED))
             else:

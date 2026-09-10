@@ -26,7 +26,7 @@
     {'value': 'age_hist', 'label': 'Status age'},
     {'value': 'signal_box', 'label': 'Mobile signal'},
   ], chart) }}
-  {{ filter_number('age_hours', 'Age threshold (h)', age_hours) }}
+  {{ filter_number('age_hours', 'Online if last seen within (h)', age_hours, min=0.25, max=72, step=0.25) }}
   {{ filter_submit() }}
 {% endcall %}
 

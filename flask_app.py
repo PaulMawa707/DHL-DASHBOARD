@@ -88,6 +88,7 @@ from web.views import (  # noqa: E402
     mix_context,
     nav_items,
     overview_context,
+    parse_online_age_hours,
     realtime_context,
 )
 
@@ -203,25 +204,15 @@ def api_logout():
 @app.route("/dashboard")
 @login_required
 def dashboard_overview():
-    age = request.args.get("age_hours", "6")
-    try:
-        age_hours = float(age)
-    except ValueError:
-        age_hours = 6.0
-    ctx = overview_context(age_hours=age_hours)
+    ctx = overview_context(age_hours=parse_online_age_hours(request.args.get("age_hours")))
     return render_template("pages/overview.html", **_layout_context(active="overview", **ctx))
 
 
 @app.route("/dashboard/realtime")
 @login_required
 def dashboard_realtime():
-    age = request.args.get("age_hours", "6")
-    try:
-        age_hours = float(age)
-    except ValueError:
-        age_hours = 6.0
     ctx = realtime_context(
-        age_hours=age_hours,
+        age_hours=parse_online_age_hours(request.args.get("age_hours")),
         fleets=request.args.getlist("fleet"),
         statuses=request.args.getlist("status"),
         ignitions=request.args.getlist("ignition"),

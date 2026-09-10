@@ -124,6 +124,15 @@ def loading_fig(message: str) -> go.Figure:
 
 # Online / offline
 
+def _online_window_label(hours: float) -> str:
+    minutes = float(hours) * 60.0
+    if minutes < 59.5:
+        return f"{minutes:g} min"
+    if float(hours).is_integer():
+        return f"{int(hours)}h"
+    return f"{hours:g}h"
+
+
 def online_offline_pie(rt_df: pd.DataFrame, age_hours_threshold: float) -> go.Figure:
     if rt_df is None or rt_df.empty:
         return EMPTY_FIG
@@ -152,7 +161,7 @@ def online_offline_pie(rt_df: pd.DataFrame, age_hours_threshold: float) -> go.Fi
         color_discrete_map={"Online": "#2E8B57", "Offline": DHL_RED, "Status Unknown": "#999"},
     )
     fig.update_traces(textposition="inside", textinfo="percent+label", marker=dict(line=dict(color="#FFFFFF", width=2)))
-    fig.update_layout(**_pie_layout(f"Online vs Offline (Online = last seen ≤ {age_hours_threshold}h)"))
+    fig.update_layout(**_pie_layout(f"Online vs Offline (Online = last seen ≤ {_online_window_label(age_hours_threshold)})"))
     fig.update_layout(uniformtext_minsize=10, uniformtext_mode="hide")
     return fig
 
