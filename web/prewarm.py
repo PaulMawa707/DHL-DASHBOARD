@@ -228,10 +228,9 @@ _auto_realtime_lock = threading.Lock()
 def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
     """Re-pull realtime status when it is stale, reusing the stored VSS token.
 
-    apiLogin is never called here: ``vss_no_login_mode`` keeps the existing
-    token in play, and if it is missing or rejected the dashboard keeps showing
-    its cached data instead of burning a login attempt (VSS throttles with
-    10082 after repeated logins).
+    Browser polls never call apiLogin (VSS throttles with 10082). The forced
+    cron path may log in once when the stored token is missing or expired, using
+    VSS credentials already on Vercel, then save the new token to Neon.
     """
     interval = realtime_auto_refresh_seconds()
     if not interval and not force:
@@ -245,16 +244,37 @@ def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
         return {"refreshed": False, "reason": "busy", "age_seconds": int(age) if age is not None else None}
 
     try:
+        token_ok = False
         with vss_no_login_mode():
-            if not try_token_without_login():
+            if try_token_without_login():
+                ok, msg = validate_or_renew_token(allow_reauth=False)
+                if ok:
+                    token_ok = True
+                else:
+                    log.info("auto-refresh: stored VSS token unusable (%s)", msg)
+                    if not force:
+                        return {"refreshed": False, "reason": "token-unusable", "message": msg}
+            elif not force:
                 log.info("auto-refresh: no stored VSS token — keeping cached realtime status")
                 return {"refreshed": False, "reason": "no-token"}
 
+        if not token_ok:
+            log.info("auto-refresh: cron re-login via VSS credentials")
+            try:
+                ensure_token(
+                    force=True,
+                    skip_file=True,
+                    login_max_wait_seconds=120,
+                    allow_10082_retry=True,
+                )
+            except Exception as login_exc:  # noqa: BLE001
+                log.warning("auto-refresh: VSS re-login failed: %s", login_exc)
+                return {"refreshed": False, "reason": "login-failed", "message": str(login_exc)}
             ok, msg = validate_or_renew_token(allow_reauth=False)
             if not ok:
-                log.info("auto-refresh: stored VSS token unusable (%s)", msg)
                 return {"refreshed": False, "reason": "token-unusable", "message": msg}
 
+        with vss_no_login_mode():
             if cache_get("dhl_devices") is None:
                 try:
                     from data import hydrate_missing_snapshots_from_neon
