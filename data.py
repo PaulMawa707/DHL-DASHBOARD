@@ -1284,6 +1284,47 @@ def _realtime_baseline_from_devices(devices_df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
+def _realtime_live_age_count(df: pd.DataFrame | None) -> int:
+    if df is None or getattr(df, "empty", True) or "AgeHours" not in df.columns:
+        return 0
+    return int(pd.to_numeric(df["AgeHours"], errors="coerce").notna().sum())
+
+
+def _previous_live_realtime() -> pd.DataFrame | None:
+    """Keep the last snapshot that still has last-seen times (online/offline)."""
+    prev = cache_peek("realtime_status")
+    if isinstance(prev, pd.DataFrame) and _realtime_live_age_count(prev) > 0:
+        return prev
+    try:
+        loaded = neon_snapshot_store.load_frame("realtime_status")
+    except Exception:  # noqa: BLE001
+        return None
+    if not loaded:
+        return None
+    df, _updated = loaded
+    if isinstance(df, pd.DataFrame) and _realtime_live_age_count(df) > 0:
+        return df
+    return None
+
+
+def _stringify_device_ids(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "DeviceID" in out.columns:
+        out["DeviceID"] = out["DeviceID"].astype(str).str.strip()
+    return out
+
+
+def _keep_previous_realtime_if_live(fallback: pd.DataFrame) -> pd.DataFrame:
+    prev = _previous_live_realtime()
+    if prev is not None:
+        log.warning(
+            "realtime VSS pull had no last-seen times — keeping previous snapshot (%s live ages)",
+            _realtime_live_age_count(prev),
+        )
+        return prev
+    return fallback
+
+
 def _load_realtime_status() -> pd.DataFrame:
     devices_df = load_dhl_devices()
     if devices_df.empty:
@@ -1291,6 +1332,7 @@ def _load_realtime_status() -> pd.DataFrame:
             pd.DataFrame(columns=["DeviceID", "DeviceName", "FleetID", "Fleet"])
         )
 
+    devices_df = _stringify_device_ids(devices_df)
     baseline_by_id = _baseline_by_device_id(devices_df)
     device_ids = sorted({str(r["DeviceID"]).strip() for r in baseline_by_id.values() if str(r.get("DeviceID", "")).strip()})
 
@@ -1298,8 +1340,8 @@ def _load_realtime_status() -> pd.DataFrame:
     try:
         rows = realtime_status_for_devices(device_ids, batch=rb, sleep_s=rs, max_workers=rw)
     except Exception as e:
-        log.warning("realtime VSS fetch failed — using device baseline: %s", e)
-        return _realtime_baseline_from_devices(devices_df)
+        log.warning("realtime VSS fetch failed: %s", e)
+        return _keep_previous_realtime_if_live(_realtime_baseline_from_devices(devices_df))
     if not rows:
         rows = []
 
@@ -1308,8 +1350,9 @@ def _load_realtime_status() -> pd.DataFrame:
 
     base = devices_df[["DeviceID", "DeviceName", "FleetID", "Fleet"]].copy()
     if rt_df.empty:
-        return _realtime_baseline_from_devices(devices_df)
+        return _keep_previous_realtime_if_live(_realtime_baseline_from_devices(devices_df))
 
+    rt_df = _stringify_device_ids(rt_df)
     rt_df = rt_df.drop(columns=["DeviceName", "FleetID", "Fleet"], errors="ignore")
     merged = base.merge(rt_df, on="DeviceID", how="left")
     merged["StatusType"] = merged["StatusType"].fillna("Status Unknown")
@@ -1319,6 +1362,8 @@ def _load_realtime_status() -> pd.DataFrame:
         col = f"VideoLost_Ch{n}"
         if col in merged.columns:
             merged[col] = merged[col].fillna("Working")
+    if _realtime_live_age_count(merged) == 0:
+        return _keep_previous_realtime_if_live(merged)
     return merged
 
 

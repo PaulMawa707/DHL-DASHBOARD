@@ -23,6 +23,7 @@ from data import (
     refresh_realtime_status,
     load_realtime_status,
     seed_device_cache_from_snapshot,
+    _realtime_live_age_count,
 )
 from vss_client import (
     active_base_url,
@@ -274,38 +275,47 @@ def auto_refresh_realtime(*, force: bool = False) -> dict[str, object]:
             if not ok:
                 return {"refreshed": False, "reason": "token-unusable", "message": msg}
 
-        with vss_no_login_mode():
-            if cache_get("dhl_devices") is None:
-                try:
-                    from data import hydrate_missing_snapshots_from_neon
-
-                    hydrate_missing_snapshots_from_neon(
-                        exclude_keys={"realtime_status", "alarms_24h", "mix_health"}
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("auto-refresh: device hydrate failed: %s", exc)
-
-            operation_log.log_event(
-                "vss_data",
-                "fetch_realtime",
-                "running",
-                f"Auto-refresh: realtime status ({interval // 60} min, stored token)",
-            )
-            rows = len(refresh_realtime_status())
-            operation_log.log_event(
-                "vss_data",
-                "fetch_realtime",
-                "ok",
-                f"Auto-refresh: realtime status complete ({rows} devices)",
-            )
-            log.info("auto-refresh: realtime status updated (%s devices)", rows)
+        if cache_get("dhl_devices") is None:
             try:
-                import neon_meta_store
+                from data import hydrate_missing_snapshots_from_neon
 
-                neon_meta_store.record_last_auto_refresh(rows=rows, source="auto")
-            except Exception as meta_exc:  # noqa: BLE001
-                log.debug("auto-refresh: could not store last time: %s", meta_exc)
-            return {"refreshed": True, "rows": rows, "age_seconds": 0}
+                hydrate_missing_snapshots_from_neon(
+                    exclude_keys={"realtime_status", "alarms_24h", "mix_health"}
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("auto-refresh: device hydrate failed: %s", exc)
+
+        operation_log.log_event(
+            "vss_data",
+            "fetch_realtime",
+            "running",
+            f"Auto-refresh: realtime status ({interval // 60} min)",
+        )
+        df = refresh_realtime_status()
+        live = _realtime_live_age_count(df)
+        rows = int(len(df)) if df is not None else 0
+        if live == 0:
+            operation_log.log_event(
+                "vss_data",
+                "fetch_realtime",
+                "error",
+                "Auto-refresh: VSS returned no last-seen times (online/offline unknown)",
+            )
+            return {"refreshed": False, "reason": "no-status-times", "rows": rows}
+        operation_log.log_event(
+            "vss_data",
+            "fetch_realtime",
+            "ok",
+            f"Auto-refresh: realtime status complete ({rows} devices, {live} with last seen)",
+        )
+        log.info("auto-refresh: realtime status updated (%s devices, %s live ages)", rows, live)
+        try:
+            import neon_meta_store
+
+            neon_meta_store.record_last_auto_refresh(rows=rows, source="auto")
+        except Exception as meta_exc:  # noqa: BLE001
+            log.debug("auto-refresh: could not store last time: %s", meta_exc)
+        return {"refreshed": True, "rows": rows, "age_seconds": 0}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         log.warning("auto-refresh: realtime status failed: %s", msg)
