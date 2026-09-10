@@ -1,11 +1,15 @@
 {% macro kpi_row(kpis) %}
 <div class="kpi-row">
   {% for k in kpis %}
+    {% if k.href %}
+    <a class="kpi-card kpi-card-link{% if k.active %} is-active{% endif %}" href="{{ k.href }}" style="--kpi-accent: {{ k.border_accent or k.accent }}">
+    {% else %}
     <div class="kpi-card" style="--kpi-accent: {{ k.border_accent or k.accent }}">
+    {% endif %}
       <div class="kpi-title">{{ k.title }}</div>
       <div class="kpi-value">{{ k.value }}</div>
       {% if k.sub %}<div class="kpi-sub">{{ k.sub }}</div>{% endif %}
-    </div>
+    {% if k.href %}</a>{% else %}</div>{% endif %}
   {% endfor %}
 </div>
 {% endmacro %}

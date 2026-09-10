@@ -6,7 +6,7 @@ from html import escape
 import os
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 
@@ -101,9 +101,19 @@ def kpi_dict(
     accent: str = DHL_RED,
     border_accent: str | None = None,
     sub: str | None = None,
+    href: str | None = None,
+    active: bool = False,
 ) -> dict:
     border = border_accent or accent
-    return {"title": title, "value": str(value), "accent": accent, "border_accent": border, "sub": sub or ""}
+    return {
+        "title": title,
+        "value": str(value),
+        "accent": accent,
+        "border_accent": border,
+        "sub": sub or "",
+        "href": href or "",
+        "active": active,
+    }
 
 
 def df_to_table_html(
@@ -255,6 +265,46 @@ def _filter_realtime(
                 flagged = _with_active_video_lost(out, age_hours)
                 out = flagged[flagged[col].astype(str) == "Not Working"]
     return out
+
+
+_REALTIME_VIEWS = ("all", "online", "offline", "video_lost", "unknown", "high", "critical")
+_REALTIME_VIEW_LABELS = {
+    "all": "All devices",
+    "online": "Online",
+    "offline": "Offline",
+    "video_lost": "Video lost",
+    "unknown": "Status unknown",
+    "high": "High alerts",
+    "critical": "Critical alerts",
+}
+
+
+def _realtime_request_view() -> str:
+    try:
+        from flask import request as flask_request
+
+        view = str(flask_request.args.get("view") or "all").strip().lower()
+    except Exception:
+        view = "all"
+    if view not in _REALTIME_VIEWS:
+        return "all"
+    return view
+
+
+def _realtime_view_href(view: str, *, current: str) -> str:
+    """Keep current Real-Time filters and set (or clear) the KPI table view."""
+    try:
+        from flask import request as flask_request
+
+        args = flask_request.args.to_dict(flat=False)
+    except Exception:
+        args = {}
+    if view in ("all", "") or view == current:
+        args.pop("view", None)
+    else:
+        args["view"] = [view]
+    query = urlencode(args, doseq=True)
+    return "/dashboard/realtime" + (f"?{query}" if query else "")
 
 
 def _filter_alarms(df: pd.DataFrame | None, *, fleets: list[str], alarm_types: list[str]) -> pd.DataFrame:
@@ -545,8 +595,9 @@ def realtime_context(
             "subtitle": "Most recent reported state for every tracked device.",
             "loading": True,
             "kpis": kpis,
-            "chart_html": _vss_unavailable_fig("Fetching live device status"),
             "table_html": df_to_table_html(None),
+            "table_title": "Device-level table",
+            "view": "all",
             "fleet_opts": fleet_opts,
             "status_opts": status_opts,
             "ignition_opts": ignition_opts,
@@ -573,33 +624,106 @@ def realtime_context(
     unknown = int(age.isna().sum()) if total else 0
     video_lost = int(_video_lost_active_mask(f, age_hours).sum()) if total else 0
     chart_df = _with_active_video_lost(f, age_hours)
+    view = _realtime_request_view()
+    sev_map = _device_severity_map(age_hours=age_hours)
+    f_ids = set(f["DeviceID"].astype(str)) if total else set()
+    high_ids = {str(did) for did, rec in sev_map.items() if rec.get("severity") == "High"}
+    crit_ids = {str(did) for did, rec in sev_map.items() if rec.get("severity") == "Critical"}
+    high_n = len(f_ids & high_ids)
+    crit_n = len(f_ids & crit_ids)
+
+    def _href(name: str) -> str:
+        return _realtime_view_href(name, current=view)
 
     kpis = [
-        kpi_dict("Devices shown", f"{total:,}", border_accent="#3B82F6"),
-        kpi_dict("Online", f"{online:,}", accent="#2E8B57", border_accent="#2E8B57"),
-        kpi_dict("Offline", f"{offline:,}", accent=DHL_RED, border_accent=DHL_RED),
+        kpi_dict(
+            "Devices shown",
+            f"{total:,}",
+            border_accent="#3B82F6",
+            href=_href("all"),
+            active=view == "all",
+        ),
+        kpi_dict(
+            "Online",
+            f"{online:,}",
+            accent="#2E8B57",
+            border_accent="#2E8B57",
+            href=_href("online"),
+            active=view == "online",
+        ),
+        kpi_dict(
+            "Offline",
+            f"{offline:,}",
+            accent=DHL_RED,
+            border_accent=DHL_RED,
+            href=_href("offline"),
+            active=view == "offline",
+        ),
         kpi_dict(
             "Video lost (ch)",
             f"{video_lost:,}",
             accent=DHL_YELLOW,
             border_accent=DHL_YELLOW,
             sub="Ignition on, online only",
+            href=_href("video_lost"),
+            active=view == "video_lost",
         ),
-        kpi_dict("Status unknown", f"{unknown:,}", accent="#999", border_accent="#9CA3AF"),
+        kpi_dict(
+            "Status unknown",
+            f"{unknown:,}",
+            accent="#999",
+            border_accent="#9CA3AF",
+            href=_href("unknown"),
+            active=view == "unknown",
+        ),
+        kpi_dict(
+            "High alerts",
+            f"{high_n:,}",
+            accent="#F59E0B",
+            border_accent="#F59E0B",
+            sub="First watchlist trigger",
+            href=_href("high"),
+            active=view == "high",
+        ),
+        kpi_dict(
+            "Critical alerts",
+            f"{crit_n:,}",
+            accent=DHL_RED,
+            border_accent=DHL_RED,
+            sub="Same vehicle, more than one of: power / video / offline / SD / storage",
+            href=_href("critical"),
+            active=view == "critical",
+        ),
     ]
-    kpis.extend(_severity_kpis(_device_severity_map(age_hours=age_hours)))
+
+    table_df = f
+    if total and view == "online":
+        table_df = f.loc[age.notna() & (age <= age_hours)]
+    elif total and view == "offline":
+        table_df = f.loc[age.notna() & (age > age_hours)]
+    elif total and view == "unknown":
+        table_df = f.loc[age.isna()]
+    elif total and view == "video_lost":
+        table_df = f.loc[_video_lost_active_mask(f, age_hours)]
+    elif total and view == "high":
+        table_df = f.loc[f["DeviceID"].astype(str).isin(high_ids)]
+    elif total and view == "critical":
+        table_df = f.loc[f["DeviceID"].astype(str).isin(crit_ids)]
+
+    chart_source = table_df if view != "all" else f
+    chart_df = _with_active_video_lost(chart_source, age_hours)
 
     chart_map = {
-        "online_pie": lambda: C.online_offline_pie(f, age_hours),
-        "status_donut": lambda: C.status_type_donut(f),
+        "online_pie": lambda: C.online_offline_pie(chart_source, age_hours),
+        "status_donut": lambda: C.status_type_donut(chart_source),
         "modules": lambda: C.module_health_bar(chart_df),
         "channels": lambda: C.channel_health_bar(chart_df),
-        "age_hist": lambda: C.age_hours_histogram(f),
-        "signal_box": lambda: C.signal_box_by_status(f),
+        "age_hist": lambda: C.age_hours_histogram(chart_source),
+        "signal_box": lambda: C.signal_box_by_status(chart_source),
     }
     fig = chart_map.get(chart, chart_map["online_pie"])()
 
-    f = annotate_realtime(f, _device_severity_map(age_hours=age_hours))
+    table_df = annotate_realtime(table_df, sev_map)
 
     table_cols = [
         "Severity",
@@ -617,15 +741,22 @@ def realtime_context(
         "batVoltage",
         "MobileSignalStrength",
     ]
-    table_cols = [c for c in table_cols if c in f.columns]
+    table_cols = [c for c in table_cols if c in table_df.columns]
+    view_label = _REALTIME_VIEW_LABELS.get(view, "All devices")
+    table_title = (
+        f"Device-level table — {view_label} ({len(table_df):,})"
+        if view != "all"
+        else f"Device-level table ({len(table_df):,})"
+    )
 
     return {
         "title": "Real-Time Device Status",
-        "subtitle": "Most recent reported state for every tracked device.",
+        "subtitle": "Click a KPI card to fill the table with those vehicles. Click it again to show all.",
         "loading": False,
         "kpis": kpis,
         "chart_html": figure_html(fig),
-        "table_html": df_to_table_html(f, table_cols),
+        "table_html": df_to_table_html(table_df, table_cols),
+        "table_title": table_title,
         "fleet_opts": fleet_opts,
         "status_opts": status_opts,
         "ignition_opts": ignition_opts,
@@ -635,6 +766,7 @@ def realtime_context(
         "ch_filter": ch_filter,
         "chart": chart,
         "age_hours": age_hours,
+        "view": view,
     }
 
 

@@ -6,6 +6,9 @@
 {{ page_header(title, subtitle) }}
 
 {% call filter_panel() %}
+  {% if view and view != 'all' %}
+  <input type="hidden" name="view" value="{{ view }}">
+  {% endif %}
   {{ filter_multi('fleet', 'Fleet', fleet_opts, fleets) }}
   {{ filter_multi('status', 'Status', status_opts, statuses) }}
   {{ filter_multi('ignition', 'Ignition', ignition_opts, ignitions) }}
@@ -32,7 +35,22 @@
 <div class="chart-card full">{{ chart_html|safe }}</div>
 
 <div class="table-card">
-  <h3 class="table-title">Device-level table</h3>
+  <h3 class="table-title">{{ table_title or "Device-level table" }}</h3>
   {{ table_html|safe }}
 </div>
+<style>
+  a.kpi-card-link {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    cursor: pointer;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+  }
+  a.kpi-card-link:hover {
+    transform: translateY(-2px);
+  }
+  a.kpi-card-link.is-active {
+    box-shadow: 0 0 0 2px var(--kpi-accent, #d40511);
+  }
+</style>
 {% endblock %}

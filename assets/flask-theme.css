@@ -1172,6 +1172,22 @@ html, body {
   background: color-mix(in srgb, var(--kpi-accent, var(--dhl-red)) 12%, transparent);
 }
 
+a.kpi-card-link {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+a.kpi-card-link:hover {
+  transform: translateY(-2px);
+}
+
+a.kpi-card-link.is-active {
+  box-shadow: 0 0 0 2px var(--kpi-accent, var(--dhl-red));
+}
+
 .kpi-title {
   color: #64748B;
 }
