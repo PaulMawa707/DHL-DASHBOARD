@@ -399,8 +399,13 @@ html, body {
   transition: opacity 80ms ease;
 }
 
+.dashboard-loading {
+  cursor: progress;
+}
+
 .dashboard-loading .main-content {
-  opacity: 0.92;
+  opacity: 0.55;
+  pointer-events: none;
 }
 
 .mobile-tab-bar {

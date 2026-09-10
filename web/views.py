@@ -116,14 +116,13 @@ def df_to_table_html(
         return '<p class="muted-msg">Loading from VSS — data will appear shortly.</p>'
     if df.empty:
         return '<p class="muted-msg">No rows match the current filters.</p>'
-    out = df.copy()
-    if columns:
-        columns = [c for c in columns if c in out.columns]
-        out = out[columns]
-    if "AlarmTime" in out.columns:
-        out = out.assign(AlarmTime=lambda d: pd.to_datetime(d["AlarmTime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S"))
-    out = out.fillna("")
-    display = out.head(max_rows).reset_index(drop=True)
+    cols = [c for c in (columns or list(df.columns)) if c in df.columns]
+    total = int(len(df))
+    display = df.loc[:, cols].head(max_rows).copy()
+    if "AlarmTime" in display.columns:
+        display["AlarmTime"] = pd.to_datetime(display["AlarmTime"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+    display = display.fillna("")
+    display = display.reset_index(drop=True)
     display.insert(0, "#", range(1, len(display) + 1))
     table = display.to_html(classes="data-table report-data-table", index=False, border=0, escape=True)
     table = table.replace("<thead>", '<thead class="sortable-head">', 1)
@@ -140,7 +139,6 @@ def df_to_table_html(
     table = table.replace("<td>Critical</td>", '<td><span class="alert-badge alert-badge-critical">Critical</span></td>')
     table = table.replace("<td>High</td>", '<td><span class="alert-badge alert-badge-high">High</span></td>')
     shown = len(display)
-    total = len(out)
     clipped = total > shown
     clipped_msg = f"Showing first {shown:,} of {total:,} rows." if clipped else f"{total:,} rows available."
     return f"""
@@ -295,13 +293,13 @@ def _device_severity_map(*, age_hours: float = 6.0) -> dict:
 def _device_directory() -> pd.DataFrame:
     cols = ["DeviceID", "DeviceName", "Fleet"]
     parts: list[pd.DataFrame] = []
-    for src in (_realtime_df(), _alarms_df(), _devices_df()):
+    for src in (_realtime_df(), _devices_df()):
         if src is None or getattr(src, "empty", True):
             continue
         have = [c for c in cols if c in src.columns]
         if "DeviceID" not in have:
             continue
-        part = src[have].copy()
+        part = src.loc[:, have].copy()
         for col in have:
             part[col] = part[col].fillna("").astype(str)
         parts.append(part)
@@ -316,10 +314,9 @@ def _high_critical_assets_df(
     device_ids: list[str] | None = None,
 ) -> pd.DataFrame:
     directory = _device_directory()
-    by_id = {
-        str(row["DeviceID"]): row
-        for _, row in directory.iterrows()
-    } if not directory.empty else {}
+    by_id: dict[str, dict[str, Any]] = {}
+    if not directory.empty:
+        by_id = directory.set_index("DeviceID").to_dict("index")
     wanted = {str(d) for d in device_ids} if device_ids is not None else None
     rows: list[dict[str, Any]] = []
     for did, rec in (sev_map or {}).items():
@@ -336,11 +333,12 @@ def _high_critical_assets_df(
         if not isinstance(kinds, (list, tuple)):
             kinds = [str(kinds)]
         events = int(rec.get("event_count") or 0)
+        name = str(meta.get("DeviceName") or "").strip() or key
         rows.append(
             {
                 "DeviceID": key,
-                "DeviceName": str(meta["DeviceName"]).strip() if "DeviceName" in meta and str(meta["DeviceName"]).strip() else key,
-                "Fleet": str(meta["Fleet"]) if "Fleet" in meta else "",
+                "DeviceName": name,
+                "Fleet": str(meta.get("Fleet") or ""),
                 "Severity": sev,
                 "AlertKinds": ", ".join(str(k) for k in kinds if k),
                 "Events": max(events, len(kinds), 1),
@@ -765,7 +763,7 @@ def alarms_context(
         "loading": False,
         "kpis": kpis,
         "chart_html": chart_html,
-        "table_html": df_to_table_html(f, table_cols),
+        "table_html": df_to_table_html(f, table_cols, max_rows=150),
         "fleet_opts": fleet_opts,
         "type_opts": type_opts,
         "fleets": fleets,

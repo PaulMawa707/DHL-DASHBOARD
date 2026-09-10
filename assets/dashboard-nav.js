@@ -46,6 +46,8 @@
     document.body.classList.toggle('dashboard-loading', busy);
   }
 
+  var prefetchAbort = null;
+
   function replaceScripts(root) {
     root.querySelectorAll('script').forEach(function (oldScript) {
       var script = document.createElement('script');
@@ -150,7 +152,7 @@
     return params;
   }
 
-  async function fetchAndCachePage(url) {
+  async function fetchAndCachePage(url, signal) {
     var target = new URL(url, window.location.href);
     if (!isDashboardUrl(target)) return null;
     var key = cacheKey(target.href);
@@ -158,7 +160,8 @@
 
     var response = await fetch(target.href, {
       credentials: 'same-origin',
-      headers: { 'X-Requested-With': 'fetch' }
+      headers: { 'X-Requested-With': 'fetch' },
+      signal: signal
     });
     if (!response.ok) return null;
 
@@ -175,31 +178,44 @@
   function prefetchDashboardPages() {
     if (prefetchStarted) return;
     prefetchStarted = true;
+    prefetchAbort = new AbortController();
     var links = Array.from(document.querySelectorAll('a.nav-item, a.mobile-tab-item'));
-    var urls = links
-      .map(function (link) { return link.href; })
-      .filter(function (href) { return isDashboardUrl(new URL(href)); });
-
-    var current = cacheKey(window.location.href);
-    urls = urls.filter(function (href) { return cacheKey(href) !== current; });
+    var seen = {};
+    var urls = [];
+    links.forEach(function (link) {
+      var href = link.href;
+      var target = new URL(href, window.location.href);
+      if (!isDashboardUrl(target)) return;
+      // MiX is slow and would occupy the only serverless slot, so skip it.
+      if (target.pathname.indexOf('/dashboard/mix') === 0) return;
+      var key = cacheKey(href);
+      if (seen[key] || key === cacheKey(window.location.href)) return;
+      seen[key] = true;
+      urls.push(href);
+    });
 
     var idx = 0;
-    function next() {
-      if (idx >= urls.length) return;
-      var href = urls[idx++];
-      fetchAndCachePage(href).finally(function () {
-        if (typeof requestIdleCallback === 'function') {
-          requestIdleCallback(next, { timeout: 2000 });
-        } else {
-          setTimeout(next, 120);
-        }
-      });
+    var inflight = 0;
+    var max = 2;
+    function pump() {
+      while (inflight < max && idx < urls.length) {
+        var href = urls[idx++];
+        inflight += 1;
+        fetchAndCachePage(href, prefetchAbort && prefetchAbort.signal).catch(function () {
+          return null;
+        }).finally(function () {
+          inflight -= 1;
+          pump();
+        });
+      }
     }
-    if (typeof requestIdleCallback === 'function') {
-      requestIdleCallback(next, { timeout: 1500 });
-    } else {
-      setTimeout(next, 300);
-    }
+    pump();
+  }
+
+  function stopPrefetch() {
+    if (prefetchAbort) prefetchAbort.abort();
+    prefetchAbort = null;
+    prefetchStarted = false;
   }
 
   async function navigateTo(url, opts) {
@@ -228,6 +244,11 @@
         window.scrollTo(0, 0);
         return true;
       }
+    }
+
+    if (!background) {
+      stopPrefetch();
+      setBusy(true);
     }
 
     if (currentController) currentController.abort();
@@ -271,6 +292,10 @@
       return false;
     } finally {
       currentController = null;
+      if (!background) {
+        setBusy(false);
+        prefetchDashboardPages();
+      }
     }
   }
 

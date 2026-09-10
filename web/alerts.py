@@ -74,14 +74,16 @@ def build_device_severity(
         return rec
 
     if alarms is not None and not alarms.empty and "DeviceID" in alarms.columns:
+        ids = alarms["DeviceID"].astype(str).str.strip()
         names = alarms["AlarmName"] if "AlarmName" in alarms.columns else pd.Series("", index=alarms.index)
-        for device_id, name in zip(alarms["DeviceID"].astype(str), names.astype(str)):
-            kind = watchlist_kind(name)
-            if not kind:
-                continue
-            rec = _bucket(device_id)
-            rec["event_count"] = int(rec["event_count"]) + 1
-            rec["kinds"].add(kind)
+        kinds = names.map(watchlist_kind)
+        watch = kinds.astype(bool) & ids.ne("")
+        if bool(watch.any()):
+            grouped = pd.DataFrame({"DeviceID": ids[watch], "kind": kinds[watch]}).groupby("DeviceID", sort=False)["kind"]
+            for did, series in grouped:
+                rec = _bucket(did)
+                rec["event_count"] = int(len(series))
+                rec["kinds"] = set(series.tolist())
 
     if realtime is not None and not realtime.empty and "DeviceID" in realtime.columns:
         for _, row in realtime.iterrows():
@@ -105,12 +107,13 @@ def annotate_alarms(df: pd.DataFrame, severity_by_device: dict[str, dict[str, An
     if df is None or df.empty:
         return df
     out = df.copy()
-    device_ids = out["DeviceID"].astype(str) if "DeviceID" in out.columns else pd.Series("", index=out.index)
+    ids = out["DeviceID"].astype(str) if "DeviceID" in out.columns else pd.Series("", index=out.index)
     names = out["AlarmName"].astype(str) if "AlarmName" in out.columns else pd.Series("", index=out.index)
-    out["Alert"] = [watchlist_kind(name) for name in names]
+    alerts = names.map(watchlist_kind)
+    out["Alert"] = alerts
     out["Severity"] = [
-        severity_by_device.get(str(did).strip(), {}).get("severity", "") if watchlist_kind(name) else ""
-        for did, name in zip(device_ids, names)
+        severity_by_device.get(str(did).strip(), {}).get("severity", "") if alert else ""
+        for did, alert in zip(ids, alerts)
     ]
     return out
 

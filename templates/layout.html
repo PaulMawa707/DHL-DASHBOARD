@@ -4,16 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ title }} · VSS MiX Fleet Health{% endblock %}</title>
+  {% if request.headers.get('X-Requested-With') != 'fetch' %}
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='dhl_logo.png') }}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css', v='20260910a') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='flask-theme.css', v='20260910b') }}">
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
   <script src="{{ url_for('static', filename='filters.js') }}" defer></script>
   <script src="{{ url_for('static', filename='tables.js') }}" defer></script>
   <script src="{{ url_for('static', filename='sidebar.js', v='20260908s') }}" defer></script>
-  <script src="{{ url_for('static', filename='dashboard-nav.js', v='20260909c') }}" defer></script>
+  <script src="{{ url_for('static', filename='dashboard-nav.js', v='20260910b') }}" defer></script>
   {% block head_extra %}{% endblock %}
   <script>
     // Applied before first paint so the collapsed rail does not flash open.
@@ -26,9 +27,12 @@
       } catch (e) {}
     })();
   </script>
+  {% endif %}
 </head>
 <body{% if awaiting_vss %} data-awaiting-realtime="1"{% endif %}>
+  {% if request.headers.get('X-Requested-With') != 'fetch' %}
   {% include 'partials/topbar.html' %}
+  {% endif %}
   {% include 'partials/sidebar_mobile.html' %}
 
   <div class="app-layout">
@@ -43,6 +47,7 @@
     </main>
   </div>
 
+  {% if request.headers.get('X-Requested-With') != 'fetch' %}
   <script>
     function updateClock() {
       const el = document.getElementById('topbar-clock');
@@ -188,6 +193,7 @@
       }
     });
   </script>
+  {% endif %}
   {% block scripts %}{% endblock %}
 </body>
 </html>
