@@ -1,8 +1,8 @@
 name: Realtime cron
 
+# Vercel Pro now runs /api/cron/realtime every 30 minutes from vercel.json.
+# Keep this workflow as a manual backup (and for local/Hobby fallback).
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -13,7 +13,7 @@ jobs:
       - name: Refresh realtime snapshot
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          DASH_URL: https://mix-vss-mawa-s-projects.vercel.app/api/cron/realtime
+          DASH_URL: https://mix-vss-data-science-geeks.vercel.app/api/cron/realtime
         run: |
           set -euo pipefail
           headers=(-H "x-vercel-cron: 1")

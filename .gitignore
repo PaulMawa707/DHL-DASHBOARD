@@ -1,4 +1,5 @@
 .env
+.env.local
 .vss_token.txt
 .vss_token.json
 accounts.json
