@@ -55,7 +55,11 @@ class _TokenRecord:
 
 
 def _normalize_base_url(url: str) -> str:
-    return (url or "").strip().rstrip("/")
+    """Host root only. Trailing ``/vss`` is stripped so login hits ``/vss/user/apiLogin.action``."""
+    out = (url or "").strip().rstrip("/")
+    if out.lower().endswith("/vss"):
+        out = out[:-4].rstrip("/")
+    return out
 
 
 _active_base_url: str = _normalize_base_url(BASE_URL) or BASE_URL
