@@ -335,6 +335,58 @@ def alarms_per_hour_line(alarms_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def high_critical_assets_bar(assets_df: pd.DataFrame, *, top_n: int = 40) -> go.Figure:
+    """Named vehicles with High / Critical watchlist alerts."""
+    if assets_df is None or assets_df.empty:
+        return loading_fig("No High or Critical assets match the current filters")
+    df = assets_df.copy()
+    if "Severity" not in df.columns:
+        return loading_fig("No High or Critical assets match the current filters")
+    df = df[df["Severity"].astype(str).isin(["High", "Critical"])]
+    if df.empty:
+        return loading_fig("No High or Critical assets match the current filters")
+
+    names = df["DeviceName"].fillna("").astype(str).str.strip() if "DeviceName" in df.columns else pd.Series("", index=df.index)
+    ids = df["DeviceID"].fillna("").astype(str) if "DeviceID" in df.columns else pd.Series("", index=df.index)
+    df["Label"] = names.where(names.ne(""), ids) + "  (" + ids + ")"
+    if "Events" in df.columns:
+        df["Events"] = pd.to_numeric(df["Events"], errors="coerce").fillna(1).clip(lower=1)
+    else:
+        df["Events"] = 1
+    df["_ord"] = df["Severity"].map({"Critical": 0, "High": 1})
+    df = df.sort_values(["_ord", "Events"], ascending=[True, False]).head(top_n)
+
+    hover = {}
+    if "Fleet" in df.columns:
+        hover["Fleet"] = True
+    if "AlertKinds" in df.columns:
+        hover["AlertKinds"] = True
+    hover["DeviceID"] = True
+    hover["Label"] = False
+
+    height = min(920, max(380, 24 * len(df) + 120))
+    fig = px.bar(
+        df,
+        x="Events",
+        y="Label",
+        orientation="h",
+        color="Severity",
+        color_discrete_map={"Critical": DHL_RED, "High": "#F59E0B"},
+        hover_data=hover,
+        category_orders={"Severity": ["Critical", "High"]},
+    )
+    layout = _bar_layout(
+        "Assets with High and Critical alerts",
+        x_title="Watchlist events",
+        showlegend=True,
+    )
+    layout["height"] = height
+    layout["margin"] = dict(l=220, r=28, t=72, b=48)
+    fig.update_layout(**layout)
+    fig.update_yaxes(autorange="reversed", tickfont=dict(size=11))
+    return fig
+
+
 def top_devices_by_alarms(alarms_df: pd.DataFrame, *, top_n: int = 20) -> go.Figure:
     if alarms_df is None or alarms_df.empty:
         return EMPTY_FIG

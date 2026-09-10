@@ -292,6 +292,63 @@ def _device_severity_map(*, age_hours: float = 6.0) -> dict:
     return build_device_severity(_alarms_df(), _realtime_df(), age_hours=age_hours)
 
 
+def _device_directory() -> pd.DataFrame:
+    cols = ["DeviceID", "DeviceName", "Fleet"]
+    parts: list[pd.DataFrame] = []
+    for src in (_realtime_df(), _alarms_df(), _devices_df()):
+        if src is None or getattr(src, "empty", True):
+            continue
+        have = [c for c in cols if c in src.columns]
+        if "DeviceID" not in have:
+            continue
+        part = src[have].copy()
+        for col in have:
+            part[col] = part[col].fillna("").astype(str)
+        parts.append(part)
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["DeviceID"], keep="first")
+
+
+def _high_critical_assets_df(
+    sev_map: dict,
+    *,
+    device_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    directory = _device_directory()
+    by_id = {
+        str(row["DeviceID"]): row
+        for _, row in directory.iterrows()
+    } if not directory.empty else {}
+    wanted = {str(d) for d in device_ids} if device_ids is not None else None
+    rows: list[dict[str, Any]] = []
+    for did, rec in (sev_map or {}).items():
+        key = str(did or "").strip()
+        if not key:
+            continue
+        if wanted is not None and key not in wanted:
+            continue
+        sev = str(rec.get("severity") or "")
+        if sev not in ("High", "Critical"):
+            continue
+        meta = by_id.get(key, {})
+        kinds = rec.get("kinds") or []
+        if not isinstance(kinds, (list, tuple)):
+            kinds = [str(kinds)]
+        events = int(rec.get("event_count") or 0)
+        rows.append(
+            {
+                "DeviceID": key,
+                "DeviceName": str(meta["DeviceName"]).strip() if "DeviceName" in meta and str(meta["DeviceName"]).strip() else key,
+                "Fleet": str(meta["Fleet"]) if "Fleet" in meta else "",
+                "Severity": sev,
+                "AlertKinds": ", ".join(str(k) for k in kinds if k),
+                "Events": max(events, len(kinds), 1),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _severity_kpis(severity_by_device: dict) -> list[dict]:
     high, critical = severity_counts(severity_by_device)
     return [
@@ -395,7 +452,8 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
         kpi_dict(alarms_kpi_label(), f"{total_alarms:,}", accent=DHL_YELLOW, border_accent=DHL_YELLOW),
         kpi_dict("Devices alarming", f"{devices_with_alarm:,}", accent=DHL_RED, border_accent="#DC2626"),
     ]
-    kpis.extend(_severity_kpis(_device_severity_map(age_hours=age_hours)))
+    sev_map = _device_severity_map(age_hours=age_hours)
+    kpis.extend(_severity_kpis(sev_map))
 
     if mix_integration_enabled():
         mix_df = _mix_df()
@@ -425,7 +483,11 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
         charts.append(figure_html(C.EMPTY_FIG))
 
     if alarms is not None and not alarms.empty:
-        charts.append(figure_html(C.top_devices_by_alarms(alarms, top_n=10)))
+        hc_assets = _high_critical_assets_df(sev_map)
+        if hc_assets.empty:
+            charts.append(figure_html(C.loading_fig("No High or Critical assets")))
+        else:
+            charts.append(figure_html(C.high_critical_assets_bar(hc_assets, top_n=15)))
         charts.append(figure_html(C.alarm_type_pie(alarms)))
     elif devices is not None or rt is not None:
         if vss_err and alarms is None:
@@ -582,11 +644,19 @@ def alarms_context(
     fleets: list[str] | None = None,
     alarm_types: list[str] | None = None,
     severity: str = "all",
-    chart: str = "type_pie",
+    chart: str = "high_critical",
 ) -> dict[str, Any]:
     df = _normalize_alarm_frame(_alarms_df())
     fleets = _parse_multi(fleets)
     alarm_types = _parse_multi(alarm_types)
+    try:
+        from flask import request as flask_request
+        if "chart" not in flask_request.args:
+            chart = "high_critical"
+        else:
+            chart = str(flask_request.args.get("chart") or "high_critical").strip() or "high_critical"
+    except Exception:
+        chart = str(chart or "high_critical").strip() or "high_critical"
     severity = str(severity or "all").strip().lower()
     if severity == "all":
         try:
@@ -650,14 +720,22 @@ def alarms_context(
     }))
 
     chart_map = {
+        "high_critical": lambda: C.high_critical_assets_bar(
+            _high_critical_assets_df(
+                sev_map,
+                device_ids=list(f["DeviceID"].astype(str).unique()) if total else [],
+            )
+        ),
         "type_pie": lambda: C.alarm_type_pie(f),
         "per_hour": lambda: C.alarms_per_hour_line(f),
         "top_devices": lambda: C.top_devices_by_alarms(f),
         "heatmap": lambda: C.fleet_alarm_heatmap(f),
         "map": lambda: C.alarm_map(f),
     }
-    if total:
-        fig = chart_map.get(chart, chart_map["type_pie"])()
+    if chart == "high_critical":
+        fig = chart_map["high_critical"]()
+    elif total:
+        fig = chart_map.get(chart, chart_map["high_critical"])()
     else:
         fig = C.loading_fig("No alarms match the current filters")
 
