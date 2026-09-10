@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -1052,6 +1052,70 @@ def normalize_vehicle_registration(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", text.upper())
 
 
+def registration_keys(*values: object) -> set[str]:
+    """Unique Kenyan plates extracted from VSS names, plates, or MiX registrations."""
+    keys: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = _PLATE_RE.search(text.upper())
+        if match:
+            keys.add(re.sub(r"\s+", "", match.group(0)))
+    return keys
+
+
+def find_mix_asset_for_vss_device(
+    *,
+    device_name: str,
+    mix_df: pd.DataFrame | None = None,
+    extra_labels: Iterable[str] | None = None,
+) -> pd.Series | None:
+    """Match a VSS device to a MiX health row by normalized registration/plate."""
+    keys = registration_keys(device_name, *(extra_labels or ()))
+    if not keys:
+        return None
+
+    if mix_df is None:
+        mix_df = cache_peek("mix_health")
+    if not isinstance(mix_df, pd.DataFrame) or mix_df.empty:
+        return None
+
+    for col in ("Registration", "AssetName"):
+        if col not in mix_df.columns:
+            continue
+        for _, row in mix_df.iterrows():
+            candidate = registration_keys(row.get(col, ""))
+            if candidate and candidate & keys:
+                return row
+    return None
+
+
+def rows_matching_vehicle(
+    df: pd.DataFrame | None,
+    *,
+    device_id: str = "",
+    keys: set[str] | None = None,
+) -> pd.DataFrame:
+    """Rows for one vehicle: VSS DeviceID and/or the same registration/plate."""
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame()
+    mask = pd.Series(False, index=df.index)
+    did = str(device_id or "").strip()
+    if did and "DeviceID" in df.columns:
+        mask = mask | df["DeviceID"].astype(str).str.strip().eq(did)
+    plates = {str(k).strip() for k in (keys or set()) if str(k).strip()}
+    if plates:
+        for col in ("PlateNo", "DeviceName", "Registration", "AssetName"):
+            if col not in df.columns:
+                continue
+            col_keys = df[col].map(lambda v: normalize_vehicle_registration(str(v or "")))
+            mask = mask | col_keys.isin(plates)
+    if not bool(mask.any()):
+        return df.iloc[0:0].copy()
+    return df.loc[mask].copy()
+
+
 def _disk_loss_from_state(state: dict) -> tuple[bool, str]:
     """Detect disk loss from live VSS stateJson (Disk Failure Record / storage module)."""
     if not isinstance(state, dict):
@@ -1122,31 +1186,6 @@ def _is_storage_abnormal_alarm(code: str, name: str) -> bool:
     if code_s == _STORAGE_ABNORMAL_ALARM_CODE:
         return True
     return name_l in ("storage error", "storage abnormal", "disk loss", "sd card missing")
-
-
-def find_mix_asset_for_vss_device(
-    *,
-    device_name: str,
-    mix_df: pd.DataFrame | None = None,
-) -> pd.Series | None:
-    """Match a VSS device to a MiX health row by normalized registration/plate."""
-    reg = normalize_vehicle_registration(device_name)
-    if not reg:
-        return None
-
-    if mix_df is None:
-        mix_df = cache_peek("mix_health")
-    if not isinstance(mix_df, pd.DataFrame) or mix_df.empty:
-        return None
-
-    for col in ("Registration", "AssetName"):
-        if col not in mix_df.columns:
-            continue
-        for _, row in mix_df.iterrows():
-            candidate = normalize_vehicle_registration(str(row.get(col, "")))
-            if candidate and candidate == reg:
-                return row
-    return None
 
 
 def _normalize_realtime_row(raw: dict, baseline_by_id: dict[str, dict]) -> dict:

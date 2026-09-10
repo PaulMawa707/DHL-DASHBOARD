@@ -18,12 +18,35 @@
 {% if device_id %}
   {{ kpi_row(kpis) }}
 
-  {% if faults %}
+  {% if mix_match %}
+    <div class="banner banner-info">
+      Matched on registration
+      {{ mix_match.registration or mix_match.asset_name }}
+      {% if mix_match.group %} · {{ mix_match.group }}{% endif %}
+    </div>
+  {% elif mix_enabled %}
+    <div class="banner">No MiX asset matched this vehicle’s registration number.</div>
+  {% endif %}
+
+  <div class="faults-card">
+    <h3 class="table-title">VSS status &amp; alarms</h3>
+    <div class="fault-pills">
+      {% for f in vss_faults %}
+        <span class="fault-pill {% if f.ok %}ok{% else %}bad{% endif %}">{{ f.label }}</span>
+      {% else %}
+        <span class="fault-pill ok">VSS checks unavailable</span>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if mix_enabled %}
     <div class="faults-card">
-      <h3 class="table-title">Current faults &amp; flags</h3>
+      <h3 class="table-title">MiX status</h3>
       <div class="fault-pills">
-        {% for f in faults %}
+        {% for f in mix_faults %}
           <span class="fault-pill {% if f.ok %}ok{% else %}bad{% endif %}">{{ f.label }}</span>
+        {% else %}
+          <span class="fault-pill ok">MiX checks unavailable</span>
         {% endfor %}
       </div>
     </div>
@@ -34,7 +57,7 @@
   {% endif %}
 
   <div class="table-card">
-    <h3 class="table-title">Alarm history (24h)</h3>
+    <h3 class="table-title">Alarm history (24h) — this registration</h3>
     {{ table_html|safe }}
   </div>
 {% else %}

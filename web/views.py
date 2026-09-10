@@ -29,7 +29,8 @@ from data import (
     load_mix_health,
     load_realtime_status,
     mix_integration_enabled,
-    normalize_vehicle_registration,
+    registration_keys,
+    rows_matching_vehicle,
     parse_channels,
 )
 from vss_client import active_base_url, last_vss_error, try_token_without_login
@@ -957,6 +958,8 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
     vss_faults: list[dict] = []
     mix_faults: list[dict] = []
     mix_match: dict[str, str] = {}
+    chart_html = figure_html(C.EMPTY_FIG)
+    table_html = df_to_table_html(None)
 
     if device_id:
         mix_df = _mix_df() if mix_integration_enabled() else None
@@ -966,8 +969,6 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
             match = rt_df[rt_df["DeviceID"].astype(str) == str(device_id)]
             if not match.empty:
                 rt_row = match.iloc[0]
-        if alarms is not None and not alarms.empty:
-            a_dev = alarms[alarms["DeviceID"].astype(str) == str(device_id)].copy()
 
         dev_row = None
         if devices is not None and not devices.empty:
@@ -981,14 +982,42 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
         elif dev_row is not None:
             device_name = str(dev_row.get("DeviceName") or "")
 
-        if device_name and mix_df is not None:
-            mix_row = find_mix_asset_for_vss_device(device_name=device_name, mix_df=mix_df)
+        id_alarms = rows_matching_vehicle(alarms, device_id=str(device_id), keys=None)
+        extra_labels = [device_name]
+        if not id_alarms.empty:
+            extra_labels.extend(str(v) for v in id_alarms.get("PlateNo", pd.Series(dtype=str)).tolist())
+            extra_labels.extend(str(v) for v in id_alarms.get("DeviceName", pd.Series(dtype=str)).tolist())
+
+        keys = registration_keys(*extra_labels)
+
+        if mix_df is not None:
+            mix_row = find_mix_asset_for_vss_device(
+                device_name=device_name,
+                mix_df=mix_df,
+                extra_labels=extra_labels,
+            )
             if mix_row is not None:
                 mix_match = {
                     "asset_name": str(mix_row.get("AssetName") or ""),
                     "registration": str(mix_row.get("Registration") or ""),
                     "group": str(mix_row.get("GroupName") or ""),
                 }
+                keys |= registration_keys(mix_match.get("registration"), mix_match.get("asset_name"))
+
+        if rt_row is None and keys:
+            plate_rt = rows_matching_vehicle(rt_df, keys=keys)
+            if not plate_rt.empty:
+                rt_row = plate_rt.iloc[0]
+                if not device_name:
+                    device_name = str(rt_row.get("DeviceName") or "")
+
+        a_dev = rows_matching_vehicle(alarms, device_id=str(device_id), keys=keys)
+
+        plate_display = (
+            mix_match.get("registration")
+            or next(iter(sorted(keys)), "")
+            or ""
+        )
 
         if rt_row is not None:
             kpis.append(kpi_dict("Status", str(rt_row.get("StatusType") or "Unknown")))
@@ -996,29 +1025,26 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
             age = rt_row.get("AgeHours")
             if pd.notna(age):
                 kpis.append(kpi_dict("Age (hours)", f"{float(age):.1f}"))
-            if mix_match:
-                kpis.append(
-                    kpi_dict(
-                        "MiX match",
-                        mix_match.get("registration") or mix_match.get("asset_name") or "Matched",
-                        accent="#F59E0B",
-                        border_accent="#F59E0B",
-                    )
-                )
         elif dev_row is not None:
             kpis.append(kpi_dict("Device", str(dev_row.get("DeviceName") or device_id)))
             kpis.append(kpi_dict("Fleet", str(dev_row.get("Fleet") or "-")))
             kpis.append(kpi_dict("Device ID", str(dev_row.get("DeviceID") or device_id)))
-            if mix_match:
-                kpis.append(
-                    kpi_dict(
-                        "MiX match",
-                        mix_match.get("registration") or mix_match.get("asset_name") or "Matched",
-                        accent="#F59E0B",
-                        border_accent="#F59E0B",
-                    )
-                )
         elif not a_dev.empty:
+            kpis.append(kpi_dict("Alarms (24h)", f"{len(a_dev):,}", accent=DHL_RED))
+
+        if plate_display:
+            kpis.append(
+                kpi_dict(
+                    "Registration",
+                    plate_display,
+                    accent="#F59E0B",
+                    border_accent="#F59E0B",
+                )
+            )
+        elif mix_integration_enabled():
+            kpis.append(kpi_dict("MiX match", "No plate match", accent=DHL_RED, border_accent=DHL_RED))
+
+        if not a_dev.empty and all(k.get("label") != "Alarms (24h)" for k in kpis):
             kpis.append(kpi_dict("Alarms (24h)", f"{len(a_dev):,}", accent=DHL_RED))
 
         vss_faults = _build_vss_faults(rt_row, a_dev)
@@ -1035,6 +1061,26 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
         if mix_integration_enabled():
             mix_faults = _build_mix_faults(mix_row, matched=mix_row is not None)
 
+        if not a_dev.empty:
+            chart_html = figure_html(
+                C.top_devices_by_alarms(
+                    a_dev.assign(DeviceName=a_dev.get("DeviceName", device_name or device_id)),
+                    top_n=min(10, max(1, a_dev["AlarmName"].nunique() if "AlarmName" in a_dev.columns else 1)),
+                )
+            )
+            table_cols = ["AlarmTime", "AlarmName", "DeviceName", "PlateNo", "Speed", "Lat", "Lon"]
+            table_html = df_to_table_html(a_dev, [c for c in table_cols if c in a_dev.columns])
+        elif dev_row is not None and rt_row is None:
+            vss_err = last_vss_error()
+            if vss_err:
+                table_html = '<p class="muted-msg">Alarm history unavailable — VSS session expired. Click Refresh data.</p>'
+            elif alarms is None:
+                table_html = '<p class="muted-msg">Loading alarm history from VSS…</p>'
+            else:
+                table_html = '<p class="muted-msg">No alarms in the last 24 hours for this registration.</p>'
+        else:
+            table_html = '<p class="muted-msg">No alarms in the last 24 hours for this registration.</p>'
+
     device_selected_label = ""
     if device_id:
         for opt in options:
@@ -1044,7 +1090,7 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
 
     return {
         "title": "Device Drilldown",
-        "subtitle": "Search or pick a vehicle to see VSS and MiX health checks for that asset.",
+        "subtitle": "VSS and MiX alarms and status for this vehicle, matched by registration number.",
         "device_id": device_id or "",
         "device_selected_label": device_selected_label,
         "device_options": options,
@@ -1054,6 +1100,8 @@ def device_context(*, device_id: str | None = None) -> dict[str, Any]:
         "mix_match": mix_match,
         "mix_enabled": mix_integration_enabled(),
         "faults": vss_faults + mix_faults,
+        "chart_html": chart_html,
+        "table_html": table_html,
     }
 
 
@@ -1106,16 +1154,23 @@ def _build_vss_faults(rt_row: pd.Series | None, a_dev: pd.DataFrame) -> list[dic
         a_dev,
         pd.DataFrame([rt_row]) if rt_row is not None else None,
     )
-    device_id = str(rt_row.get("DeviceID") or "") if rt_row is not None else ""
-    if not device_id and a_dev is not None and not a_dev.empty:
-        device_id = str(a_dev.iloc[0].get("DeviceID") or "")
-    rec = severity_rec.get(device_id) or next(iter(severity_rec.values()), {})
-    if rec.get("severity"):
-        kinds = ", ".join(rec.get("kinds") or [])
+    kinds: set[str] = set()
+    events = 0
+    for rec in (severity_rec or {}).values():
+        kinds.update(rec.get("kinds") or [])
+        events += int(rec.get("event_count") or 0)
+    if events >= 2 or len(kinds) >= 2:
+        severity = "Critical"
+    elif events >= 1 or len(kinds) >= 1:
+        severity = "High"
+    else:
+        severity = ""
+    if severity:
+        kind_label = ", ".join(sorted(kinds))
         faults.insert(
             0,
             {
-                "label": f"Alert severity: {rec['severity']}" + (f" ({kinds})" if kinds else ""),
+                "label": f"Alert severity: {severity}" + (f" ({kind_label})" if kind_label else ""),
                 "ok": False,
             },
         )
