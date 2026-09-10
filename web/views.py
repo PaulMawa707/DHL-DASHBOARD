@@ -487,7 +487,7 @@ def overview_context(*, age_hours: float = 6.0) -> dict[str, Any]:
         if hc_assets.empty:
             charts.append(figure_html(C.loading_fig("No High or Critical assets")))
         else:
-            charts.append(figure_html(C.high_critical_assets_bar(hc_assets, top_n=15)))
+            charts.append(C.high_critical_assets_panel(hc_assets, per_group=8))
         charts.append(figure_html(C.alarm_type_pie(alarms)))
     elif devices is not None or rt is not None:
         if vss_err and alarms is None:
@@ -719,26 +719,6 @@ def alarms_context(
         for did in (f["DeviceID"].astype(str).unique() if total else [])
     }))
 
-    chart_map = {
-        "high_critical": lambda: C.high_critical_assets_bar(
-            _high_critical_assets_df(
-                sev_map,
-                device_ids=list(f["DeviceID"].astype(str).unique()) if total else [],
-            )
-        ),
-        "type_pie": lambda: C.alarm_type_pie(f),
-        "per_hour": lambda: C.alarms_per_hour_line(f),
-        "top_devices": lambda: C.top_devices_by_alarms(f),
-        "heatmap": lambda: C.fleet_alarm_heatmap(f),
-        "map": lambda: C.alarm_map(f),
-    }
-    if chart == "high_critical":
-        fig = chart_map["high_critical"]()
-    elif total:
-        fig = chart_map.get(chart, chart_map["high_critical"])()
-    else:
-        fig = C.loading_fig("No alarms match the current filters")
-
     table_cols = [
         "Severity",
         "Alert",
@@ -761,12 +741,30 @@ def alarms_context(
         ]
     )
     chart_div = "alarms-" + re.sub(r"[^a-z0-9]+", "-", filter_key.lower()).strip("-")[:72]
+    chart_map = {
+        "type_pie": lambda: C.alarm_type_pie(f),
+        "per_hour": lambda: C.alarms_per_hour_line(f),
+        "top_devices": lambda: C.top_devices_by_alarms(f),
+        "heatmap": lambda: C.fleet_alarm_heatmap(f),
+        "map": lambda: C.alarm_map(f),
+    }
+    assets = _high_critical_assets_df(
+        sev_map,
+        device_ids=list(f["DeviceID"].astype(str).unique()) if total else [],
+    )
+    if chart == "high_critical":
+        chart_html = C.high_critical_assets_panel(assets, per_group=16)
+    elif total:
+        fig = chart_map.get(chart, chart_map["type_pie"])()
+        chart_html = figure_html(fig, div_id=chart_div)
+    else:
+        chart_html = figure_html(C.loading_fig("No alarms match the current filters"), div_id=chart_div)
     return {
         "title": "Alarms — Last 24 hours",
         "subtitle": "First watchlist trigger is High; a second of power / video / offline / SD / storage on the same vehicle is Critical.",
         "loading": False,
         "kpis": kpis,
-        "chart_html": figure_html(fig, div_id=chart_div),
+        "chart_html": chart_html,
         "table_html": df_to_table_html(f, table_cols),
         "fleet_opts": fleet_opts,
         "type_opts": type_opts,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from html import escape
 from typing import Iterable
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.express as px
@@ -335,56 +337,87 @@ def alarms_per_hour_line(alarms_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def high_critical_assets_bar(assets_df: pd.DataFrame, *, top_n: int = 40) -> go.Figure:
-    """Named vehicles with High / Critical watchlist alerts."""
-    if assets_df is None or assets_df.empty:
-        return loading_fig("No High or Critical assets match the current filters")
+def high_critical_assets_panel(assets_df: pd.DataFrame, *, per_group: int = 12) -> str:
+    """Two-column High / Critical ranking — readable names, no packed Plotly labels."""
+    empty = (
+        '<div class="hc-board">'
+        '<div class="hc-board-head"><h3 class="hc-board-title">Assets with High and Critical alerts</h3></div>'
+        '<p class="muted-msg">No High or Critical assets match the current filters.</p>'
+        "</div>"
+    )
+    if assets_df is None or assets_df.empty or "Severity" not in assets_df.columns:
+        return empty
+
     df = assets_df.copy()
-    if "Severity" not in df.columns:
-        return loading_fig("No High or Critical assets match the current filters")
     df = df[df["Severity"].astype(str).isin(["High", "Critical"])]
     if df.empty:
-        return loading_fig("No High or Critical assets match the current filters")
+        return empty
 
-    names = df["DeviceName"].fillna("").astype(str).str.strip() if "DeviceName" in df.columns else pd.Series("", index=df.index)
-    ids = df["DeviceID"].fillna("").astype(str) if "DeviceID" in df.columns else pd.Series("", index=df.index)
-    df["Label"] = names.where(names.ne(""), ids) + "  (" + ids + ")"
     if "Events" in df.columns:
         df["Events"] = pd.to_numeric(df["Events"], errors="coerce").fillna(1).clip(lower=1)
     else:
         df["Events"] = 1
-    df["_ord"] = df["Severity"].map({"Critical": 0, "High": 1})
-    df = df.sort_values(["_ord", "Events"], ascending=[True, False]).head(top_n)
+    names = df["DeviceName"].fillna("").astype(str).str.strip() if "DeviceName" in df.columns else pd.Series("", index=df.index)
+    ids = df["DeviceID"].fillna("").astype(str) if "DeviceID" in df.columns else pd.Series("", index=df.index)
+    df["Name"] = names.where(names.ne(""), ids)
+    n_crit = int((df["Severity"] == "Critical").sum())
+    n_high = int((df["Severity"] == "High").sum())
+    peak = float(df["Events"].max() or 1)
 
-    hover = {}
-    if "Fleet" in df.columns:
-        hover["Fleet"] = True
-    if "AlertKinds" in df.columns:
-        hover["AlertKinds"] = True
-    hover["DeviceID"] = True
-    hover["Label"] = False
+    def _rows(severity: str) -> str:
+        part = df[df["Severity"] == severity].sort_values("Events", ascending=False).head(per_group)
+        if part.empty:
+            return '<p class="hc-empty">None</p>'
+        items: list[str] = []
+        for i, row in enumerate(part.itertuples(index=False), start=1):
+            name = escape(str(getattr(row, "Name", "") or ""))
+            did = escape(str(getattr(row, "DeviceID", "") or ""))
+            kinds = escape(str(getattr(row, "AlertKinds", "") or ""))
+            fleet = escape(str(getattr(row, "Fleet", "") or ""))
+            events = int(getattr(row, "Events", 1) or 1)
+            width = max(8, round(100 * events / peak))
+            href = f"/dashboard/device?device_id={quote(str(getattr(row, 'DeviceID', '') or ''), safe='')}"
+            tone = "critical" if severity == "Critical" else "high"
+            meta = " · ".join(x for x in (fleet, kinds) if x)
+            items.append(
+                "<li class='hc-item'>"
+                f"<span class='hc-rank'>{i}</span>"
+                "<div class='hc-main'>"
+                f"<a class='hc-name' href='{href}' title='{name} ({did})'>{name}</a>"
+                f"<div class='hc-bar-track'><span class='hc-bar {tone}' style='width:{width}%'></span></div>"
+                f"<p class='hc-kinds'>{meta}</p>"
+                "</div>"
+                f"<span class='hc-count'>{events}</span>"
+                "</li>"
+            )
+        more = int((df["Severity"] == severity).sum()) - len(part)
+        extra = f"<p class='hc-more'>+{more} more</p>" if more > 0 else ""
+        return "<ol class='hc-list'>" + "".join(items) + "</ol>" + extra
 
-    height = min(920, max(380, 24 * len(df) + 120))
-    fig = px.bar(
-        df,
-        x="Events",
-        y="Label",
-        orientation="h",
-        color="Severity",
-        color_discrete_map={"Critical": DHL_RED, "High": "#F59E0B"},
-        hover_data=hover,
-        category_orders={"Severity": ["Critical", "High"]},
+    return (
+        '<div class="hc-board">'
+        '<div class="hc-board-head">'
+        '<div>'
+        '<h3 class="hc-board-title">Assets with High and Critical alerts</h3>'
+        f'<p class="hc-board-meta">{n_crit} Critical · {n_high} High · ranked by watchlist events</p>'
+        "</div>"
+        '<div class="hc-board-legend">'
+        '<span><i class="hc-swatch critical"></i> Critical</span>'
+        '<span><i class="hc-swatch high"></i> High</span>'
+        "</div>"
+        "</div>"
+        '<div class="hc-cols">'
+        '<section class="hc-col">'
+        f'<h4 class="hc-col-title critical">Critical · {n_crit}</h4>'
+        f"{_rows('Critical')}"
+        "</section>"
+        '<section class="hc-col">'
+        f'<h4 class="hc-col-title high">High · {n_high}</h4>'
+        f"{_rows('High')}"
+        "</section>"
+        "</div>"
+        "</div>"
     )
-    layout = _bar_layout(
-        "Assets with High and Critical alerts",
-        x_title="Watchlist events",
-        showlegend=True,
-    )
-    layout["height"] = height
-    layout["margin"] = dict(l=220, r=28, t=72, b=48)
-    fig.update_layout(**layout)
-    fig.update_yaxes(autorange="reversed", tickfont=dict(size=11))
-    return fig
 
 
 def top_devices_by_alarms(alarms_df: pd.DataFrame, *, top_n: int = 20) -> go.Figure:
