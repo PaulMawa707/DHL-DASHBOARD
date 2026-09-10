@@ -13,7 +13,7 @@ jobs:
       - name: Refresh realtime snapshot
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
-          DASH_URL: https://mix-vss-data-science-geeks.vercel.app/api/cron/realtime
+          DASH_URL: https://mix-vss-two.vercel.app/api/cron/realtime
         run: |
           set -euo pipefail
           headers=(-H "x-vercel-cron: 1")
