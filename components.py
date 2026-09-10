@@ -211,7 +211,7 @@ def module_health_bar(rt_df: pd.DataFrame) -> go.Figure:
 def channel_health_bar(
     rt_df: pd.DataFrame, *, channels: Iterable[int] | None = None
 ) -> go.Figure:
-    """Per channel CH1..CH4: Working / Video lost (``videoloststateFormatter``) / Camera covered (mask)."""
+    """Per channel CH1..CH3: Working / Video lost (``videoloststateFormatter``) / Camera covered (mask)."""
     if channels is None:
         channels = tuple(range(1, RT_VIDEO_LOST_CHANNEL_MAX + 1))
     if rt_df is None or rt_df.empty:

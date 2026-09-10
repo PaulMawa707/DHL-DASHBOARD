@@ -265,7 +265,8 @@ def _filter_alarms(df: pd.DataFrame | None, *, fleets: list[str], alarm_types: l
     if fleets:
         out = out[out["Fleet"].astype(str).isin(fleets)]
     if alarm_types:
-        out = out[out["AlarmName"].astype(str).isin(alarm_types)]
+        wanted = {canonical_alarm_name(t) for t in alarm_types if str(t).strip()}
+        out = out[out["AlarmName"].astype(str).isin(wanted)]
     return out
 
 
@@ -327,7 +328,6 @@ def nav_items(*, active: str, mix_enabled: bool) -> list[dict]:
     items = [
         {"id": "overview", "label": "Overview", "href": "/dashboard", "icon": "grid"},
         {"id": "realtime", "label": "Real-Time Status", "href": "/dashboard/realtime", "icon": "radio"},
-        {"id": "camera", "label": "Camera", "href": "/dashboard/camera", "icon": "camera"},
         {"id": "alarms", "label": "Alarms (24h)", "href": "/dashboard/alarms", "icon": "bell"},
         {"id": "device", "label": "Device Drilldown", "href": "/dashboard/device", "icon": "search"},
         {"id": "logs", "label": "Logs", "href": "/dashboard/logs", "icon": "document"},
@@ -644,7 +644,10 @@ def alarms_context(
         kpi_dict("Distinct alarm types", f"{distinct_types:,}", accent=DHL_YELLOW, border_accent=DHL_YELLOW),
         kpi_dict("Most recent event", last_seen, accent="#3B3B3B", border_accent="#6B7280"),
     ]
-    kpis.extend(_severity_kpis(sev_map))
+    kpis.extend(_severity_kpis({
+        str(did): sev_map.get(str(did), {})
+        for did in (f["DeviceID"].astype(str).unique() if total else [])
+    }))
 
     chart_map = {
         "type_pie": lambda: C.alarm_type_pie(f),
@@ -653,7 +656,10 @@ def alarms_context(
         "heatmap": lambda: C.fleet_alarm_heatmap(f),
         "map": lambda: C.alarm_map(f),
     }
-    fig = chart_map.get(chart, chart_map["type_pie"])()
+    if total:
+        fig = chart_map.get(chart, chart_map["type_pie"])()
+    else:
+        fig = C.loading_fig("No alarms match the current filters")
 
     table_cols = [
         "Severity",
@@ -668,12 +674,21 @@ def alarms_context(
         "Lat",
         "Lon",
     ]
+    filter_key = "-".join(
+        [
+            chart,
+            severity,
+            ",".join(sorted(fleets)),
+            ",".join(sorted(alarm_types)),
+        ]
+    )
+    chart_div = "alarms-" + re.sub(r"[^a-z0-9]+", "-", filter_key.lower()).strip("-")[:72]
     return {
         "title": "Alarms — Last 24 hours",
         "subtitle": "First watchlist trigger is High; a second of power / video / offline / SD / storage on the same vehicle is Critical.",
         "loading": False,
         "kpis": kpis,
-        "chart_html": figure_html(fig),
+        "chart_html": figure_html(fig, div_id=chart_div),
         "table_html": df_to_table_html(f, table_cols),
         "fleet_opts": fleet_opts,
         "type_opts": type_opts,

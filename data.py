@@ -967,16 +967,20 @@ def _row_str(row: dict, *names: str, default: str = "") -> str:
 
 _CHANNEL_RE = re.compile(r"ch(\d+)", re.I)
 
+# Per-channel columns + Real-Time filter dropdown (CH1..CH3 — DHL cameras).
+RT_VIDEO_LOST_CHANNEL_MAX = 3
+
 
 def parse_channels(formatter: str) -> list[int]:
-    """Parse 'ch1;ch2;ch3;' into [1, 2, 3]."""
+    """Parse 'ch1;ch2;ch3;' into [1, 2, 3]. Ignores CH4+ (not in the DHL fleet)."""
     if not isinstance(formatter, str) or not formatter.strip():
         return []
-    return [int(m.group(1)) for m in _CHANNEL_RE.finditer(formatter)]
-
-
-# Per-channel columns + Real-Time filter dropdown (CH1..CH4 — last camera channel).
-RT_VIDEO_LOST_CHANNEL_MAX = 4
+    out: list[int] = []
+    for m in _CHANNEL_RE.finditer(formatter):
+        n = int(m.group(1))
+        if 1 <= n <= RT_VIDEO_LOST_CHANNEL_MAX:
+            out.append(n)
+    return out
 
 
 def _realtime_fetch_params() -> tuple[int, float, int]:

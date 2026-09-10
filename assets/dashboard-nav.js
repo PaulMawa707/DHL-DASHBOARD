@@ -29,13 +29,17 @@
     root.querySelectorAll('[data-bound]').forEach(function (el) {
       delete el.dataset.bound;
     });
+    root.querySelectorAll('[data-device-picker]').forEach(function (el) {
+      delete el.dataset.devicePickerEnhanced;
+    });
   }
 
   function stripEnhancementFromHtml(html) {
     return html
       .replace(/\sdata-filter-enhanced="1"/g, '')
       .replace(/\sdata-enhanced="1"/g, '')
-      .replace(/\sdata-bound="1"/g, '');
+      .replace(/\sdata-bound="1"/g, '')
+      .replace(/\sdata-device-picker-enhanced="1"/g, '');
   }
 
   function setBusy(busy) {
@@ -97,6 +101,7 @@
     replaceScripts(root);
     window.DashboardFilters?.init(root);
     window.DashboardTables?.init(root);
+    window.DashboardDevicePicker?.init(root);
   }
 
   function cacheEntryFromDoc(nextDoc, nextMain) {
@@ -206,6 +211,9 @@
 
     var key = cacheKey(target.href);
     var force = Boolean(opts && opts.force);
+    // Background reloads must never interrupt or override a click the user just made.
+    var background = Boolean(opts && opts.background);
+    if (background && (currentController || cacheKey(window.location.href) !== key)) return false;
     updateNavActiveState(target.href);
 
     if (!force && pageCache.has(key)) {
@@ -239,6 +247,11 @@
       var currentMain = document.querySelector('.main-content');
       if (!nextMain || !currentMain) throw new Error('Navigation target missing');
 
+      if (background && cacheKey(window.location.href) !== key) {
+        storePageCache(key, cacheEntryFromDoc(nextDoc, nextMain));
+        return false;
+      }
+
       syncShell(nextDoc);
       currentMain.replaceWith(nextMain);
       initDynamicContent(nextMain);
@@ -252,7 +265,7 @@
       window.scrollTo(0, 0);
       return true;
     } catch (error) {
-      if (error.name !== 'AbortError') {
+      if (error.name !== 'AbortError' && !background) {
         window.location.href = target.href;
       }
       return false;
@@ -268,7 +281,12 @@
     var action = form.getAttribute('action') || window.location.pathname;
     var target = new URL(action, window.location.href);
     target.search = formSearchParams(form).toString();
-    pageCache.delete(cacheKey(target.href));
+    var prefix = target.pathname;
+    Array.from(pageCache.keys()).forEach(function (key) {
+      if (key === prefix || key.indexOf(prefix + '?') === 0) {
+        pageCache.delete(key);
+      }
+    });
     navigateTo(target.href);
     return true;
   }
@@ -291,6 +309,28 @@
     if (!form || (form.getAttribute('method') || 'get').toLowerCase() !== 'get') return;
     event.preventDefault();
     navigateForm(form);
+  });
+
+  var filterDebounce = null;
+  document.addEventListener('change', function (event) {
+    var form = event.target.closest('form.filter-panel');
+    if (!form || (form.getAttribute('method') || 'get').toLowerCase() !== 'get') return;
+    var el = event.target;
+    if (el.matches('.filter-select')) {
+      if (filterDebounce) {
+        clearTimeout(filterDebounce);
+        filterDebounce = null;
+      }
+      navigateForm(form);
+      return;
+    }
+    if (el.matches('input[type="checkbox"]')) {
+      if (filterDebounce) clearTimeout(filterDebounce);
+      filterDebounce = setTimeout(function () {
+        filterDebounce = null;
+        navigateForm(form);
+      }, 250);
+    }
   });
 
   window.addEventListener('popstate', function () {
