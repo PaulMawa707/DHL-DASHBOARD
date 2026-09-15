@@ -1,14 +1,21 @@
 name: Realtime cron
 
+# Ping the public production alias every 15 minutes. The API skips the VSS
+# pull when the snapshot is still younger than 30 minutes, so a missed tick is
+# recovered on the next quarter-hour instead of waiting another 30 minutes.
+# GitHub schedule can lag; retries cover transient 5xx/timeouts.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+    concurrency:
+      group: mix-vss-realtime-cron
+      cancel-in-progress: false
     steps:
       - name: Refresh realtime snapshot
         env:
@@ -16,8 +23,21 @@ jobs:
           DASH_URL: https://mix-vss-two.vercel.app/api/cron/realtime
         run: |
           set -euo pipefail
-          headers=(-H "x-vercel-cron: 1")
+          headers=(-H "x-vercel-cron: 1" -H "User-Agent: github-actions-realtime-cron")
           if [ -n "${CRON_SECRET:-}" ]; then
             headers+=(-H "Authorization: Bearer ${CRON_SECRET}")
           fi
-          curl -fsS --max-time 240 -X GET "${headers[@]}" "$DASH_URL"
+          for attempt in 1 2 3; do
+            echo "attempt ${attempt}/3"
+            tmp="$(mktemp)"
+            code="$(curl -sS --max-time 240 -o "$tmp" -w "%{http_code}" -X GET "${headers[@]}" "$DASH_URL" || true)"
+            cat "$tmp"
+            echo
+            echo "HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep $((attempt * 15))
+          done
+          echo "cron ping failed after 3 attempts"
+          exit 1

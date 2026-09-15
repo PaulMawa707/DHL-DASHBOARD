@@ -26,15 +26,22 @@ def verify_login(username: str, password: str) -> bool:
 
 
 def cron_request_authorized() -> bool:
-    """Allow Vercel Cron, an optional Bearer secret, or local Flask."""
+    """Allow Vercel Cron, GitHub backup pings, an optional Bearer secret, or local Flask.
+
+    Vercel Cron sends ``User-Agent: vercel-cron/1.0`` and ``x-vercel-cron: 1``.
+    A configured ``CRON_SECRET`` must not block those platform headers — otherwise
+    native Vercel ticks 401 and only the flaky GitHub schedule remains.
+    """
+    ua = (request.headers.get("User-Agent") or "").lower()
+    if "vercel-cron" in ua:
+        return True
+    if (request.headers.get("x-vercel-cron") or "").strip() == "1":
+        return True
     secret = _env("CRON_SECRET") or _env("DHL_CRON_SECRET")
     auth = (request.headers.get("Authorization") or "").strip()
     if secret:
         return auth == f"Bearer {secret}"
-    if os.environ.get("VERCEL", "").strip() == "1":
-        # Vercel Cron always sends this. Set CRON_SECRET to require a Bearer token.
-        return (request.headers.get("x-vercel-cron") or "").strip() == "1"
-    return True
+    return os.environ.get("VERCEL", "").strip() != "1"
 
 
 def login_required(view):
