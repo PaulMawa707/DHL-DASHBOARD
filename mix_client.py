@@ -154,7 +154,7 @@ def _load_server_creds() -> dict[str, str]:
             "IdentityClientSecret": _env("MIX_CLIENT_SECRET"),
             "IdentityUsername": _env("MIX_USERNAME"),
             "IdentityPassword": _env("MIX_PASSWORD"),
-            "IdentityScope": _env("MIX_SCOPE", "openid profile offline_access"),
+            "IdentityScope": _env("MIX_SCOPE", "offline_access MiX.Integrate"),
         }
     server_key = _server_key()
     all_creds = _load_accounts_blob()
@@ -179,8 +179,12 @@ def ensure_bearer_token() -> str:
     creds = _load_server_creds()
     token_url = f"{creds['IdentityUrl'].rstrip('/')}/core/connect/token"
     scope = creds.get("IdentityScope", "").replace("+", " ")
-    if not scope:
-        scope = "openid profile offline_access MiX.Integrate"
+    parts = [p for p in scope.split() if p and p not in ("openid", "profile")]
+    if "offline_access" not in parts:
+        parts.insert(0, "offline_access")
+    if "MiX.Integrate" not in parts:
+        parts.append("MiX.Integrate")
+    scope = " ".join(parts)
     payload = {
         "grant_type": "password",
         "client_id": creds["IdentityClientId"],
