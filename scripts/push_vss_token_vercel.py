@@ -310,44 +310,13 @@ def should_skip_refresh(*, force: bool) -> bool:
     if force:
         return False
 
-    threshold = _token_ttl_hours() - _refresh_lead_hours()
+    from vss_client import _load_token_record, _token_is_live
 
-    neon_age = neon_token_age_hours()
-    if neon_age is not None:
-        if neon_age < threshold:
-            print(
-                f"Skip: Neon VSS token was updated {neon_age:.1f}h ago "
-                f"(refresh threshold {threshold:.1f}h)"
-            )
-            return True
-        print(f"Neon VSS token is {neon_age:.1f}h old — refreshing")
-        return False
-
-    try:
-        vercel_age = vercel_env_age_hours("VSS_TOKEN")
-    except Exception as exc:  # noqa: BLE001
-        print(f"Could not read Vercel env age ({exc}); continuing with refresh check")
-        vercel_age = None
-
-    if vercel_age is not None and vercel_age < threshold:
-        print(
-            f"Skip: VSS_TOKEN on Vercel was updated {vercel_age:.1f}h ago "
-            f"(refresh threshold {threshold:.1f}h)"
-        )
+    rec = _load_token_record()
+    if rec and rec.token and _token_is_live(rec.token):
+        print("Skip: Neon VSS token is still accepted by VSS")
         return True
-
-    local_age = local_token_age_hours()
-    if local_age is not None and local_age < threshold:
-        from vss_client import _load_token_record, _token_is_live
-
-        rec = _load_token_record()
-        if rec and rec.token and _token_is_live(rec.token):
-            print(
-                f"Skip: local token is {local_age:.1f}h old and still live "
-                f"(refresh threshold {threshold:.1f}h)"
-            )
-            return True
-
+    print("Neon VSS token missing or rejected (10023) — apiLogin")
     return False
 
 

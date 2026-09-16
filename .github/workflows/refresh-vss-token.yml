@@ -2,8 +2,8 @@ name: Refresh VSS token on Vercel
 
 on:
   schedule:
-    # Every 12 hours; script skips if the Neon token was updated within ~22h (23h TTL).
-    - cron: "0 */12 * * *"
+    # Every 6 hours. The script skips apiLogin when the Neon token is still live.
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 jobs:
