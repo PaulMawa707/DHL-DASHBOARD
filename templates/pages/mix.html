@@ -9,7 +9,7 @@
   <div class="banner banner-warn">{{ notice }}</div>
 {% else %}
   {% if notice %}
-    <div class="banner banner-warn" role="alert"><strong>MiX connection issue:</strong> {{ notice }}</div>
+    <div class="banner banner-warn" role="status">{{ notice }}</div>
   {% endif %}
 
   {% call filter_panel() %}
@@ -27,5 +27,12 @@
     <h3 class="table-title">Flagged assets</h3>
     {{ table_html|safe }}
   </div>
+
+  {% if freewheel_table_html %}
+  <div class="table-card">
+    <h3 class="table-title">Freewheeling (last 7 days)</h3>
+    {{ freewheel_table_html|safe }}
+  </div>
+  {% endif %}
 {% endif %}
 {% endblock %}

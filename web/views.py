@@ -42,8 +42,14 @@ except ImportError:  # Production image may not include the camera proxy yet.
 
     def _stream_wss_hostname() -> str:
         return ""
-from mix_health import ALL_ISSUES
-from web.alerts import annotate_alarms, annotate_realtime, build_device_severity, severity_counts
+from mix_health import ALL_ISSUES, ISSUE_FREEWHEELING, freewheel_assets_dataframe, order_health_table_columns
+from web.alerts import (
+    _live_video_lost,
+    annotate_alarms,
+    annotate_realtime,
+    build_device_severity,
+    severity_counts,
+)
 from web.charts import figure_html
 from web.prewarm import realtime_auto_refresh_seconds
 
@@ -239,15 +245,12 @@ def _video_lost_active_mask(df: pd.DataFrame, age_hours: float) -> pd.Series:
     """True only when a device reports video lost while ignition is on and online.
 
     Offline units often keep a stale "video lost" flag from the last report,
-    which should not count as a live camera fault.
+    which should not count as a live camera fault. Channels shown as recording
+    in VSS ``recordstateFormatter`` are also treated as recovered.
     """
     if df is None or df.empty:
         return pd.Series(dtype=bool)
-    lost = df.get("NotRecordingFlag", pd.Series("", index=df.index)).astype(str).eq("Not Working")
-    ign = df.get("Ignition", pd.Series("", index=df.index)).astype(str).str.strip().str.lower().eq("on")
-    age = pd.to_numeric(df.get("AgeHours"), errors="coerce") if "AgeHours" in df.columns else pd.Series(float("nan"), index=df.index)
-    online = age.notna() & (age <= float(age_hours))
-    return lost & ign & online
+    return df.apply(lambda row: _live_video_lost(row, age_hours=age_hours), axis=1)
 
 
 def _with_active_video_lost(df: pd.DataFrame, age_hours: float) -> pd.DataFrame:
@@ -857,7 +860,7 @@ def alarms_context(
     if df is None:
         return {
             "title": "Alarms — Last 24 hours",
-            "subtitle": "Watchlist: power loss, video loss, offline, SD card missing, storage error.",
+            "subtitle": "Last 24 hours of VSS events. High/Critical are faults that are still active — recovered video loss is listed as Cleared.",
             "loading": True,
             "kpis": [],
             "chart_html": _vss_unavailable_fig("Fetching alarms"),
@@ -897,6 +900,7 @@ def alarms_context(
 
     table_cols = [
         "Severity",
+        "Status",
         "Alert",
         "AlarmTime",
         "DeviceName",
@@ -937,7 +941,7 @@ def alarms_context(
         chart_html = figure_html(C.loading_fig("No alarms match the current filters"), div_id=chart_div)
     return {
         "title": "Alarms — Last 24 hours",
-        "subtitle": "First watchlist trigger is High; a second of power / video / offline / SD / storage on the same vehicle is Critical.",
+        "subtitle": "Last 24 hours of VSS events. High/Critical are faults that are still active — recovered video loss is listed as Cleared.",
         "loading": False,
         "kpis": kpis,
         "chart_html": chart_html,
@@ -1411,6 +1415,7 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
             "table_html": "",
             "issue_opts": [],
             "issues": issues,
+            "freewheel_table_html": "",
         }
 
     df = _mix_df()
@@ -1427,6 +1432,7 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
             "table_html": df_to_table_html(None) if not mix_err else "",
             "issue_opts": list(ALL_ISSUES),
             "issues": issues,
+            "freewheel_table_html": "",
         }
 
     f = df.copy()
@@ -1447,28 +1453,37 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
         )
         has_comm = any("comm" in mode for mode in scan_modes)
         has_rpm = any("rpm" in mode for mode in scan_modes)
-        if has_comm and has_rpm:
-            notice = (
-                "Inventory + comm + RPM scan — flags 'Non downloading', 'No GPS data', "
-                "and 'Diagnostic: no engine RPM (7d)'."
-            )
-        elif has_comm:
-            notice = (
-                "Inventory + comm scan — flags 'Non downloading' and 'No GPS data' from latest positions."
-            )
-        elif has_rpm:
-            notice = (
-                "Inventory + RPM diagnostic scan — only 'Diagnostic: no engine RPM (7d)' is evaluated "
-                "from MiX event history."
-            )
+        has_freewheel = any("freewheel" in mode for mode in scan_modes)
+        flags = []
+        if has_comm:
+            flags.extend(["Non downloading", "No GPS data"])
+        if has_rpm:
+            flags.append("Diagnostic: no engine RPM (7d)")
+        if has_freewheel:
+            flags.append("Freewheeling (7d)")
+        if flags:
+            notice = "Inventory + event scan — flags " + ", ".join(f"'{name}'" for name in flags) + "."
         else:
             notice = (
-                "Inventory scan only — GPS, speed, and RPM health flags are not evaluated yet. "
+                "Inventory scan only — GPS, speed, RPM, and freewheeling flags are not evaluated yet. "
                 "Counts show registered assets, not confirmed faults."
             )
+    freewheel_count = 0
+    if "Freewheel7d" in f.columns and not f.empty:
+        freewheel_count = int(f["Freewheel7d"].fillna(False).astype(bool).sum())
+    elif "Issues" in f.columns and not f.empty:
+        freewheel_count = int(
+            f["Issues"].astype(str).str.contains(ISSUE_FREEWHEELING, regex=False).sum()
+        )
     kpis = [
         kpi_dict("Assets shown", f"{len(f):,}", border_accent="#3B82F6"),
         kpi_dict("With issues", f"{flagged:,}", accent=DHL_RED if flagged else "#2E8B57", border_accent=DHL_RED if flagged else "#2E8B57"),
+        kpi_dict(
+            "Freewheeling (7d)",
+            f"{freewheel_count:,}",
+            accent=DHL_YELLOW if freewheel_count else "#2E8B57",
+            border_accent=DHL_YELLOW if freewheel_count else "#2E8B57",
+        ),
     ]
 
     issue_opts = list(ALL_ISSUES)
@@ -1499,7 +1514,24 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
                 fig.update_layout(margin=dict(l=20, r=20, t=40, b=80))
                 chart_html = figure_html(fig)
 
-    show_cols = [c for c in ["AssetName", "Registration", "IssueCount", "Issues", "LastSeen"] if c in f.columns]
+    table_df = order_health_table_columns(f)
+    show_cols = [
+        c
+        for c in [
+            "AssetName",
+            "Registration",
+            "GroupName",
+            "FreewheelCount7d",
+            "LastFreewheelTime",
+            "RpmFaultCount7d",
+            "LastRpmFaultTime",
+            "IssueCount",
+            "Issues",
+            "AgeHours",
+        ]
+        if c in table_df.columns
+    ]
+    freewheel_table = freewheel_assets_dataframe(f)
     return {
         "title": "MiX Telematics",
         "subtitle": "Diageo DHL sites on MiX — health flags and diagnostics.",
@@ -1508,7 +1540,8 @@ def mix_context(*, issues: list[str] | None = None) -> dict[str, Any]:
         "loading": False,
         "kpis": kpis,
         "chart_html": chart_html,
-        "table_html": df_to_table_html(f, show_cols),
+        "table_html": df_to_table_html(table_df, show_cols),
+        "freewheel_table_html": df_to_table_html(freewheel_table) if not freewheel_table.empty else "",
         "issue_opts": issue_opts,
         "issues": issues,
     }

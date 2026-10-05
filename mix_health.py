@@ -10,37 +10,42 @@ from typing import Any
 import pandas as pd
 
 from mix_client import (
+    _load_site_targets_cache,
+    _normalize_mix_id,
     _parse_event_age_hours,
+    _site_targets_from_health_snapshot,
     _safe_get,
-    analyze_tacho,
     api_base_url,
     ensure_bearer_token,
+    fetch_assets_for_groups_batched,
+    fetch_comm_check_positions,
     fetch_latest_positions,
-    fetch_tacho_for_assets,
     group_ids,
     resolve_group_targets,
 )
-from mix_events import fetch_rpm_fault_events, resolve_rpm_fault_event_type_ids
+from mix_events import (
+    fetch_events_for_type_ids,
+    fetch_library_events,
+    resolve_freewheel_event_type_ids,
+    resolve_rpm_fault_event_type_ids,
+)
 
 log = logging.getLogger(__name__)
 
 ISSUE_NON_DOWNLOADING = "Non downloading"
-ISSUE_NO_SPEED = "No speed data"
 ISSUE_NO_GPS = "No GPS data"
-# MiX diagnostic library event — NOT live tacho F2 / GPS.
+# MiX diagnostic library events — from event history, not live telemetry.
 ISSUE_NO_RPM = "Diagnostic: no engine RPM (7d)"
-ISSUE_INCONSISTENT_RPM = "Inconsistent RPM (tacho)"
-ISSUE_SPEED_SPIKE = "Possible speed spike"
+ISSUE_FREEWHEELING = "Freewheeling (7d)"
 
 ALL_ISSUES = [
     ISSUE_NON_DOWNLOADING,
-    ISSUE_NO_SPEED,
     ISSUE_NO_GPS,
     ISSUE_NO_RPM,
-    ISSUE_SPEED_SPIKE,
+    ISSUE_FREEWHEELING,
 ]
 
-# Shown first in the Asset health issues table (event report columns before live tacho).
+# Shown first in the Asset health issues table (event columns before position fields).
 _HEALTH_TABLE_COLUMN_ORDER = [
     "AssetName",
     "Registration",
@@ -49,16 +54,13 @@ _HEALTH_TABLE_COLUMN_ORDER = [
     "RpmFault7d",
     "RpmFaultCount7d",
     "LastRpmFaultTime",
+    "Freewheel7d",
+    "FreewheelCount7d",
+    "LastFreewheelTime",
     "Issues",
     "IssueCount",
     "AgeHours",
     "EventTime",
-    "SpeedKmh",
-    "TachoRpmF2",
-    "MaxTachoRpmF2",
-    "TachoRpmStdDev",
-    "MaxRecentSpeedKmh",
-    "SpeedJumpKmh",
     "GpsSource",
     "Satellites",
     "Latitude",
@@ -77,21 +79,19 @@ _HEALTH_COLUMNS = [
     "GroupName",
     "EventTime",
     "AgeHours",
-    "SpeedKmh",
-    "MaxRecentSpeedKmh",
-    "SpeedJumpKmh",
     "GpsSource",
     "Satellites",
     "Latitude",
     "Longitude",
-    "TachoRpmF2",
-    "MaxTachoRpmF2",
-    "TachoRpmStdDev",
     "RpmFault7d",
     "RpmFaultCount7d",
     "LastRpmFaultTime",
+    "Freewheel7d",
+    "FreewheelCount7d",
+    "LastFreewheelTime",
     "Issues",
     "IssueCount",
+    "ScanMode",
     "LastUpdated",
 ]
 
@@ -155,49 +155,69 @@ def _valid_gps(lat: Any, lon: Any, source: str, sats: Any) -> bool:
     return True
 
 
-def _classify_row(
+def _classify_health_issues(
     *,
     age_h: float | None,
-    has_speed_feed: bool,
-    speed: float | None,
-    max_recent_speed: float | None,
-    speed_jump: float | None,
     lat: Any,
     lon: Any,
     source: str,
     sats: Any,
-    has_rpm_feed: bool,
     rpm_fault_7d: bool,
-    rpm_std: float | None,
+    freewheel_7d: bool,
     stale_h: float,
-    spike_kmh: float,
-    jump_kmh: float,
-    rpm_std_threshold: float,
-    deep: bool,
+    check_comm: bool,
+    check_rpm: bool,
+    check_freewheel: bool,
 ) -> list[str]:
     issues: list[str] = []
 
-    if age_h is None or age_h > stale_h:
-        issues.append(ISSUE_NON_DOWNLOADING)
+    if check_comm:
+        if age_h is None or age_h > stale_h:
+            issues.append(ISSUE_NON_DOWNLOADING)
+        elif not _valid_gps(lat, lon, source, sats):
+            issues.append(ISSUE_NO_GPS)
 
-    if not has_speed_feed:
-        issues.append(ISSUE_NO_SPEED)
-
-    if not _valid_gps(lat, lon, source, sats):
-        issues.append(ISSUE_NO_GPS)
-
-    if deep:
-        if rpm_fault_7d:
-            issues.append(ISSUE_NO_RPM)
-        elif _env_truthy("MIX_RPM_INCONSISTENT", "0") and rpm_std is not None and rpm_std >= rpm_std_threshold:
-            issues.append(ISSUE_INCONSISTENT_RPM)
-
-        if max_recent_speed is not None and max_recent_speed >= spike_kmh:
-            issues.append(ISSUE_SPEED_SPIKE)
-        elif speed_jump is not None and speed_jump >= jump_kmh:
-            issues.append(ISSUE_SPEED_SPIKE)
+    if check_rpm and rpm_fault_7d:
+        issues.append(ISSUE_NO_RPM)
+    if check_freewheel and freewheel_7d:
+        issues.append(ISSUE_FREEWHEELING)
 
     return issues
+
+
+def _inventory_scan_mode(*, comm: bool, rpm: bool, freewheel: bool = False) -> str:
+    parts = ["inventory"]
+    if comm:
+        parts.append("comm")
+    if rpm:
+        parts.append("rpm")
+    if freewheel:
+        parts.append("freewheel")
+    return "+".join(parts)
+
+
+def _events_by_asset(events: list[dict[str, Any]], wanted_ids: set[int]) -> dict[str, dict[str, Any]]:
+    """Count matching events per asset and keep the latest timestamp."""
+    out: dict[str, dict[str, Any]] = {}
+    if not wanted_ids:
+        return out
+    for ev in events:
+        etid = ev.get("EventTypeId")
+        if etid is None or int(etid) not in wanted_ids:
+            continue
+        aid = str(ev.get("AssetId", ""))
+        if not aid:
+            continue
+        ts = ev.get("StartDateTime") or ev.get("EndDateTime") or ""
+        row = out.get(aid)
+        if row is None:
+            out[aid] = {"count": 1, "last": ts, "category": ev.get("EventCategory", "")}
+        else:
+            row["count"] = int(row.get("count", 0)) + 1
+            if str(ts) > str(row.get("last", "")):
+                row["last"] = ts
+                row["category"] = ev.get("EventCategory", row.get("category", ""))
+    return out
 
 
 def build_health_dataframe() -> pd.DataFrame:
@@ -206,69 +226,122 @@ def build_health_dataframe() -> pd.DataFrame:
 
     api_url = api_base_url()
     token = ensure_bearer_token()
-    targets = resolve_group_targets()
+    org_id = _normalize_mix_id(_env("MIX_PARENT_ORG_ID") or _env("MIX_ORGANISATION_ID"))
+    site_prefix = _env("MIX_SITE_PREFIX", "DHL")
+    try:
+        targets = resolve_group_targets()
+    except RuntimeError as exc:
+        log.warning("MiX health: site resolution failed (%s)", exc)
+        targets = (
+            _load_site_targets_cache(org_id, site_prefix)
+            if org_id
+            else None
+        ) or _site_targets_from_health_snapshot(site_prefix) or []
+    if not targets and org_id:
+        log.warning(
+            "MiX health: site list unavailable — using org-level asset inventory for org %s",
+            org_id,
+        )
+    log.info("MiX health: resolved %s site group(s) for asset pull", len(targets))
     group_name_by_id = {int(t["GroupId"]): t.get("Name", "") for t in targets}
+    gids = [int(t["GroupId"]) for t in targets]
 
-    positions = fetch_latest_positions()
+    try:
+        auto_light_threshold = int(_env("MIX_HEALTH_LIGHT_AUTO_THRESHOLD", "25") or "25")
+    except ValueError:
+        auto_light_threshold = 25
+    light = _env_truthy("MIX_HEALTH_LIGHT", "0")
+    if len(targets) > auto_light_threshold and not _env_truthy("MIX_HEALTH_FORCE_DEEP", "0"):
+        light = True
+    rpm_diag = _env_truthy("MIX_HEALTH_RPM_DIAG", "1" if light else "0")
+    freewheel_diag = _env_truthy("MIX_HEALTH_FREEWHEEL_DIAG", "1" if light else "0")
+    comm_check = _env_truthy("MIX_HEALTH_COMM_CHECK", "1" if light else "0")
+    if light:
+        bits = ["assets"]
+        if comm_check:
+            bits.append("comm+gps")
+        if rpm_diag:
+            bits.append("RPM diagnostics")
+        if freewheel_diag:
+            bits.append("freewheeling")
+        log.info(
+            "MiX health: light mode for %s site(s) — %s (skip tacho/speed)",
+            len(targets),
+            " + ".join(bits),
+        )
+
     pos_by_asset: dict[str, dict[str, Any]] = {}
-    for row in positions:
-        aid = _safe_get(row, "AssetId", "assetId")
-        if aid:
-            pos_by_asset[aid] = row
+    if not light:
+        positions = fetch_latest_positions()
+        for row in positions:
+            aid = _safe_get(row, "AssetId", "assetId")
+            if aid:
+                pos_by_asset[aid] = row
+    elif comm_check and targets:
+        for row in fetch_comm_check_positions(targets, api_url=api_url, token=token):
+            aid = _safe_get(row, "AssetId", "assetId")
+            if aid:
+                pos_by_asset[aid] = row
 
-    asset_rows: list[dict[str, Any]] = []
-    for gid in group_ids():
-        asset_rows.extend(_fetch_group_assets(api_url, token, gid))
+    asset_rows = fetch_assets_for_groups_batched(
+        api_url,
+        token,
+        gids,
+        org_id=_normalize_mix_id(_env("MIX_PARENT_ORG_ID") or _env("MIX_ORGANISATION_ID")),
+    )
+    if not asset_rows and gids:
+        log.warning("MiX health: org/bulk asset fetch empty; retrying per site group")
+        asset_rows = []
+        seen_asset_ids: set[str] = set()
+        for gid in gids:
+            for asset in _fetch_group_assets(api_url, token, gid):
+                aid = str(asset.get("AssetId", asset.get("assetId", "")))
+                if aid:
+                    if aid in seen_asset_ids:
+                        continue
+                    seen_asset_ids.add(aid)
+                asset_rows.append(asset)
 
     if not asset_rows:
-        log.warning("MiX health: no assets returned for groups %s", group_ids())
+        log.warning("MiX health: no assets returned for groups %s", gids)
         return empty_health_dataframe()
 
     stale_h = _env_float("MIX_NON_DOWNLOADING_HOURS", 6.0)
-    spike_kmh = _env_float("MIX_SPEED_SPIKE_KMH", 120.0)
-    jump_kmh = _env_float("MIX_SPEED_JUMP_KMH", 45.0)
-    rpm_std_threshold = _env_float("MIX_RPM_INCONSISTENT_STDDEV", 400.0)
-    tacho_minutes = _env_int("MIX_TACHO_MINUTES", 59)
-    deep = _env_truthy("MIX_HEALTH_DEEP", "1")
 
     run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     out_rows: list[dict[str, Any]] = []
 
-    asset_ids = [
-        int(asset.get("AssetId", asset.get("assetId")))
-        for asset in asset_rows
-        if asset.get("AssetId", asset.get("assetId"))
-    ]
-    tacho_by_asset = fetch_tacho_for_assets(api_url, token, asset_ids, minutes=tacho_minutes)
-    log.info("MiX health: tacho loaded for %s asset(s) (cached where recent)", len(tacho_by_asset))
-
     rpm_fault_by_asset: dict[str, dict[str, Any]] = {}
-    rpm_event_type_ids = resolve_rpm_fault_event_type_ids()
-    if rpm_event_type_ids:
-        for ev in fetch_rpm_fault_events():
-            etid = ev.get("EventTypeId")
-            if etid is not None and int(etid) not in rpm_event_type_ids:
-                continue
-            aid = str(ev.get("AssetId", ""))
-            if not aid:
-                continue
-            ts = ev.get("StartDateTime") or ev.get("EndDateTime") or ""
-            row = rpm_fault_by_asset.get(aid)
-            if row is None:
-                rpm_fault_by_asset[aid] = {
-                    "count": 1,
-                    "last": ts,
-                    "category": ev.get("EventCategory", ""),
-                }
-            else:
-                row["count"] = int(row.get("count", 0)) + 1
-                if str(ts) > str(row.get("last", "")):
-                    row["last"] = ts
-                    row["category"] = ev.get("EventCategory", row.get("category", ""))
-        log.info(
-            "MiX health: %s asset(s) with no-engine-RPM diagnostic event(s) in lookback window",
-            len(rpm_fault_by_asset),
+    freewheel_by_asset: dict[str, dict[str, Any]] = {}
+    run_rpm_diag = rpm_diag if light else True
+    run_freewheel_diag = freewheel_diag if light else True
+    if run_rpm_diag or run_freewheel_diag:
+        library = fetch_library_events()
+        rpm_ids = resolve_rpm_fault_event_type_ids(library) if run_rpm_diag else []
+        freewheel_ids = resolve_freewheel_event_type_ids(library) if run_freewheel_diag else []
+        combined_ids = sorted(set(rpm_ids + freewheel_ids))
+        window_days = _env_int("MIX_RPM_FAULT_DAYS", 7)
+        if run_freewheel_diag:
+            window_days = max(window_days, _env_int("MIX_FREEWHEEL_DAYS", 7))
+        events = fetch_events_for_type_ids(
+            combined_ids,
+            days=window_days,
+            group_ids=gids or None,
+            org_id=org_id,
+            log_label="health diagnostics",
         )
+        rpm_fault_by_asset = _events_by_asset(events, set(rpm_ids))
+        freewheel_by_asset = _events_by_asset(events, set(freewheel_ids))
+        if run_rpm_diag:
+            log.info(
+                "MiX health: %s asset(s) with no-engine-RPM diagnostic event(s) in lookback window",
+                len(rpm_fault_by_asset),
+            )
+        if run_freewheel_diag:
+            log.info(
+                "MiX health: %s asset(s) with freewheeling event(s) in lookback window",
+                len(freewheel_by_asset),
+            )
 
     catalog_rows: list[dict[str, Any]] = []
 
@@ -276,7 +349,11 @@ def build_health_dataframe() -> pd.DataFrame:
         aid = str(asset.get("AssetId", asset.get("assetId", "")))
         if not aid:
             continue
-        gid = asset.get("SiteId") or asset.get("GroupId") or group_ids()[0]
+        gid = asset.get("SiteId") or asset.get("GroupId") or asset.get("siteId") or gids[0]
+        try:
+            gid_int = int(gid)
+        except (TypeError, ValueError):
+            gid_int = gids[0]
         pos = pos_by_asset.get(aid, {})
 
         event_time = _safe_get(pos, "Timestamp", "EventTime")
@@ -287,49 +364,39 @@ def build_health_dataframe() -> pd.DataFrame:
         source = _safe_get(pos, "Source", "source")
         sats = pos.get("NumberOfSatellites", "")
 
-        speed: float | None = None
-        rpm: float | None = None
-        max_recent_speed: float | None = None
-        speed_jump: float | None = None
-        max_rpm: float | None = None
-        rpm_std: float | None = None
-
-        tacho = tacho_by_asset.get(aid)
-        tach = analyze_tacho(tacho)
-        speed = tach["speed_kmh"]
-        rpm = tach["rpm"]
-        max_recent_speed = tach["max_speed_kmh"]
-        speed_jump = tach["speed_jump_kmh"]
-        max_rpm = tach["max_rpm"]
-        rpm_std = tach["rpm_std"]
         fault = rpm_fault_by_asset.get(aid, {})
         rpm_fault_7d = bool(fault)
         rpm_fault_count = int(fault.get("count", 0)) if fault else 0
         last_rpm_fault = fault.get("last", "") if fault else ""
+        fw = freewheel_by_asset.get(aid, {})
+        freewheel_7d = bool(fw)
+        freewheel_count = int(fw.get("count", 0)) if fw else 0
+        last_freewheel = fw.get("last", "") if fw else ""
 
-        issues = _classify_row(
+        check_comm = comm_check if light else bool(pos_by_asset)
+        issues = _classify_health_issues(
             age_h=age_h,
-            has_speed_feed=bool(tach["has_speed_feed"]),
-            speed=speed,
-            max_recent_speed=max_recent_speed,
-            speed_jump=speed_jump,
             lat=lat,
             lon=lon,
             source=source,
             sats=sats,
-            has_rpm_feed=bool(tach["has_rpm_feed"]),
             rpm_fault_7d=rpm_fault_7d,
-            rpm_std=rpm_std,
+            freewheel_7d=freewheel_7d,
             stale_h=stale_h,
-            spike_kmh=spike_kmh,
-            jump_kmh=jump_kmh,
-            rpm_std_threshold=rpm_std_threshold,
-            deep=deep,
+            check_comm=check_comm,
+            check_rpm=run_rpm_diag,
+            check_freewheel=run_freewheel_diag,
         )
+        if light:
+            scan_mode = _inventory_scan_mode(
+                comm=comm_check, rpm=run_rpm_diag, freewheel=run_freewheel_diag
+            )
+        else:
+            scan_mode = "full"
 
         asset_name = _safe_get(asset, "Description", "description")
         registration = _safe_get(asset, "RegistrationNumber", "registrationNumber")
-        group_name = group_name_by_id.get(int(gid), str(gid))
+        group_name = group_name_by_id.get(gid_int, str(gid_int))
         catalog_rows.append(
             {
                 "AssetId": aid,
@@ -346,25 +413,23 @@ def build_health_dataframe() -> pd.DataFrame:
                 "AssetName": asset_name,
                 "Registration": registration,
                 "Make": _safe_get(asset, "Make", "make"),
-                "GroupId": str(gid),
+                "GroupId": str(gid_int),
                 "GroupName": group_name,
                 "EventTime": event_time,
                 "AgeHours": round(age_h, 2) if age_h is not None else None,
-                "SpeedKmh": speed,
-                "MaxRecentSpeedKmh": max_recent_speed,
-                "SpeedJumpKmh": speed_jump,
                 "GpsSource": source,
                 "Satellites": sats,
                 "Latitude": lat,
                 "Longitude": lon,
-                "TachoRpmF2": rpm,
-                "MaxTachoRpmF2": max_rpm,
-                "TachoRpmStdDev": rpm_std,
                 "RpmFault7d": rpm_fault_7d,
                 "RpmFaultCount7d": rpm_fault_count,
                 "LastRpmFaultTime": last_rpm_fault,
+                "Freewheel7d": freewheel_7d,
+                "FreewheelCount7d": freewheel_count,
+                "LastFreewheelTime": last_freewheel,
                 "Issues": "; ".join(issues),
                 "IssueCount": len(issues),
+                "ScanMode": scan_mode,
                 "LastUpdated": run_ts,
             }
         )
@@ -394,7 +459,7 @@ def build_health_dataframe() -> pd.DataFrame:
 
 
 def order_health_table_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Prefer 7-day RPM fault report columns before live tacho RPM."""
+    """Prefer 7-day RPM fault report columns before position fields."""
     if df is None or df.empty:
         return df
     cols = [c for c in _HEALTH_TABLE_COLUMN_ORDER if c in df.columns]
@@ -410,7 +475,6 @@ _RPM_FAULT_LIST_COLUMNS = [
     "RpmFaultCount7d",
     "LastRpmFaultTime",
     "AgeHours",
-    "TachoRpmF2",
     "Issues",
     "AssetId",
 ]
@@ -429,4 +493,33 @@ def rpm_fault_assets_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
         na_position="last",
     )
     cols = [c for c in _RPM_FAULT_LIST_COLUMNS if c in out.columns]
+    return out[cols]
+
+
+_FREEWHEEL_LIST_COLUMNS = [
+    "AssetName",
+    "Registration",
+    "Make",
+    "GroupName",
+    "FreewheelCount7d",
+    "LastFreewheelTime",
+    "AgeHours",
+    "Issues",
+    "AssetId",
+]
+
+
+def freewheel_assets_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Assets with MiX Freewheeling event(s) in the 7-day window."""
+    if df is None or df.empty or "Freewheel7d" not in df.columns:
+        return pd.DataFrame(columns=_FREEWHEEL_LIST_COLUMNS)
+    out = df[df["Freewheel7d"].fillna(False).astype(bool)].copy()
+    if out.empty:
+        return pd.DataFrame(columns=_FREEWHEEL_LIST_COLUMNS)
+    out = out.sort_values(
+        ["FreewheelCount7d", "LastFreewheelTime"],
+        ascending=[False, False],
+        na_position="last",
+    )
+    cols = [c for c in _FREEWHEEL_LIST_COLUMNS if c in out.columns]
     return out[cols]
